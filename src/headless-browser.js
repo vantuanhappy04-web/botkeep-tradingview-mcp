@@ -109,8 +109,7 @@ async function resolveSparticuzChromium() {
   process.env.VERCEL = '1';
 
   const binDir = join(__dirname, '..', 'node_modules', '@sparticuz', 'chromium', 'bin');
-  const { inflate } = await import('@sparticuz/chromium/build/lambdafs.js');
-  const { setupLambdaEnvironment } = await import('@sparticuz/chromium/build/helper.js');
+  const { inflate, setupLambdaEnvironment } = await import('@sparticuz/chromium');
 
   console.log(`[tv-browser] Extracting headless Chromium into ${runtimeDir} ...`);
   const [chromiumPath, , , al2023Path] = await Promise.all([

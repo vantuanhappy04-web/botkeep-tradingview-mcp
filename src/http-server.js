@@ -499,16 +499,55 @@ const httpServer = http.createServer(async (req, res) => {
   }
 });
 
-httpServer.listen(PORT, HOST, () => {
+process.stdin.setEncoding('utf8');
+process.stdin.on('data', async (chunk) => {
+  const line = chunk.trim();
+  if (!line) return;
+  const parts = line.split(/\s+/);
+  const cmd = parts[0].toLowerCase();
+  try {
+    if (cmd === 'update' || cmd === 'pull') {
+      console.log('[console] Đang kéo bản cập nhật mới từ GitHub...');
+      const r = await autoUpdate({ installDeps: true });
+      console.log('[console] Kết quả update:', JSON.stringify(r));
+      process.exit(75);
+    } else if (cmd === 'status' || cmd === 'health') {
+      const h = await healthCheck().catch((e) => ({ error: e.message }));
+      console.log('[console] Trạng thái:', JSON.stringify({ browser: getBrowserState(), tradingview: h }, null, 2));
+    } else if (cmd === 'login' && parts[1]) {
+      const r = await injectTradingViewCookies({ sessionid: parts[1], sessionid_sign: parts[2] });
+      console.log('[console] Kết quả đăng nhập cookie:', JSON.stringify(r));
+    } else if (cmd === 'restart') {
+      const r = await ensureHeadlessTradingView({ forceRestart: true });
+      console.log('[console] Đã khởi động lại Chromium:', JSON.stringify(r));
+    } else {
+      console.log('[console] Lệnh hỗ trợ: update | status | restart | login <sessionid> <sessionid_sign>');
+    }
+  } catch (e) {
+    console.error('[console] Lỗi:', e.message);
+  }
+});
+
+httpServer.listen(PORT, HOST, async () => {
+  let publicHost = process.env.SERVER_IP || process.env.PUBLIC_IP || '';
+  if (!publicHost) {
+    try {
+      const r = await fetch('https://api.ipify.org', { signal: AbortSignal.timeout(3000) });
+      if (r.ok) publicHost = (await r.text()).trim();
+    } catch {}
+  }
+  const displayHost = publicHost || HOST;
+
   console.log(`=============================================================`);
-  console.log(`🚀 TradingView MCP Remote Server listening on http://${HOST}:${PORT}`);
-  console.log(`   • Live Chart Viewer   : http://${HOST}:${PORT}/view`);
-  console.log(`   • Live Screenshot     : http://${HOST}:${PORT}/screenshot`);
-  console.log(`   • Streamable HTTP MCP : http://${HOST}:${PORT}/mcp (or /)`);
-  console.log(`   • SSE MCP             : http://${HOST}:${PORT}/sse`);
-  console.log(`   • Health & Status     : http://${HOST}:${PORT}/health`);
-  console.log(`   • Auto-Update Trigger : http://${HOST}:${PORT}/update`);
-  console.log(`   • Tools registered    : 84 tools (full tradingview-mcp)`);
+  console.log(`🚀 TradingView MCP Remote Server listening on http://${displayHost}:${PORT}`);
+  console.log(`   • Xem Biểu Đồ Trực Tiếp : http://${displayHost}:${PORT}/view`);
+  console.log(`   • Ảnh Chụp Biểu Đồ      : http://${displayHost}:${PORT}/screenshot`);
+  console.log(`   • Streamable HTTP MCP   : http://${displayHost}:${PORT}/mcp`);
+  console.log(`   • SSE MCP               : http://${displayHost}:${PORT}/sse`);
+  console.log(`   • Kiểm Tra Trạng Thái   : http://${displayHost}:${PORT}/health`);
+  console.log(`   • Cập Nhật Code GitHub  : http://${displayHost}:${PORT}/update`);
+  console.log(`   • Công cụ đã bật        : 84 tools (full tradingview-mcp)`);
+  console.log(`   • Lệnh gõ tại Console   : update | status | restart | login <sid> <sig>`);
   console.log(`=============================================================`);
 
   if (process.env.TV_AUTO_LAUNCH !== 'false') {
