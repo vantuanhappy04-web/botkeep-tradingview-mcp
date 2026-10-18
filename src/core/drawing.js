@@ -40,6 +40,9 @@ export async function drawShape({ shape, point, point2, overrides: overridesRaw,
   await new Promise(r => setTimeout(r, 200));
   const after = await evaluate(`${apiPath}.getAllShapes().map(function(s) { return s.id; })`);
   const newId = (after || []).find(id => !(before || []).includes(id)) || null;
+  if (!_deps) {
+    evaluate(`(function(){ try { if (window.TradingViewApi && typeof window.TradingViewApi.saveChartToServer === 'function') { window.TradingViewApi.saveChartToServer(); } else { var b = document.querySelector('#header-toolbar-save-load, [data-name="save-load-menu"]'); if (b) b.click(); } } catch(e){} })()`).catch(() => {});
+  }
   const result = { entity_id: newId };
   return { success: true, shape, entity_id: result?.entity_id };
 }
