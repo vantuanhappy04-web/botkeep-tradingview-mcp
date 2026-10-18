@@ -1,0 +1,35 @@
+{
+  "name": "tradingview-mcp",
+  "version": "2.0.0",
+  "description": "Remote HTTP/SSE & Stdio MCP bridge for TradingView (84 tools) with embedded Headless Chromium for Botkeep/Cloud",
+  "type": "module",
+  "main": "src/http-server.js",
+  "bin": {
+    "tv": "src/cli/index.js"
+  },
+  "exports": {
+    ".": "./src/http-server.js",
+    "./stdio": "./src/server.js",
+    "./core": "./src/core/index.js"
+  },
+  "scripts": {
+    "start": "node src/http-server.js",
+    "start:http": "node src/http-server.js",
+    "start:stdio": "node src/server.js",
+    "tv": "node src/cli/index.js",
+    "lint": "eslint src/",
+    "test": "node --test tests/e2e.test.js tests/pine_analyze.test.js",
+    "test:e2e": "node --test tests/e2e.test.js",
+    "test:unit": "node --test tests/pine_analyze.test.js tests/cli.test.js tests/sanitization.test.js tests/replay.test.js tests/launch.test.js tests/chart_indicator.test.js tests/chart_history.test.js tests/update.test.js",
+    "test:cli": "node --test tests/cli.test.js",
+    "test:all": "node --test tests/e2e.test.js tests/pine_analyze.test.js tests/cli.test.js tests/sanitization.test.js tests/replay.test.js tests/launch.test.js tests/chart_indicator.test.js tests/chart_history.test.js tests/update.test.js"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.12.1",
+    "@sparticuz/chromium": "^153.0.0",
+    "chrome-remote-interface": "^0.33.2"
+  },
+  "devDependencies": {
+    "eslint": "^9.39.4"
+  }
+}

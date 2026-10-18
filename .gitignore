@@ -1,0 +1,9 @@
+node_modules/
+screenshots/
+scripts/current.pine
+temp_*
+tmp-*
+.tv-chromium/
+*.log
+discovery-log.json
+rules.json
