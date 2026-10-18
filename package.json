@@ -1,19 +1,21 @@
 {
   "name": "tradingview-mcp",
   "version": "2.0.0",
-  "description": "Remote HTTP/SSE & Stdio MCP bridge for TradingView (84 tools) with embedded Headless Chromium for Botkeep/Cloud",
+  "description": "Remote HTTP/SSE & Stdio MCP bridge for TradingView (84 tools) with embedded Headless Chromium & Auto-Update for Botkeep",
   "type": "module",
-  "main": "src/http-server.js",
+  "main": "start.js",
   "bin": {
     "tv": "src/cli/index.js"
   },
   "exports": {
-    ".": "./src/http-server.js",
+    ".": "./start.js",
+    "./http": "./src/http-server.js",
     "./stdio": "./src/server.js",
     "./core": "./src/core/index.js"
   },
   "scripts": {
-    "start": "node src/http-server.js",
+    "start": "node start.js",
+    "update": "node src/auto-update.js",
     "start:http": "node src/http-server.js",
     "start:stdio": "node src/server.js",
     "tv": "node src/cli/index.js",

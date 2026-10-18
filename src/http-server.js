@@ -1,3 +1,4 @@
+import './env-loader.js';
 import http from 'node:http';
 import { randomUUID } from 'node:crypto';
 import { URL } from 'node:url';
@@ -11,6 +12,7 @@ import {
   startBrowserWatchdog,
 } from './headless-browser.js';
 import { healthCheck } from './core/health.js';
+import { autoUpdate } from './auto-update.js';
 
 const PORT = Number(
   process.env.PORT ||
@@ -205,11 +207,13 @@ const httpServer = http.createServer(async (req, res) => {
             tools_count: 84,
             status: 'ok',
             auth_enabled: Boolean(API_KEY),
+            auto_update_enabled: process.env.TV_AUTO_UPDATE !== 'false',
             endpoints: {
               streamable_http: `${baseUrl}/mcp`,
               sse: `${baseUrl}/sse`,
               sse_messages: `${baseUrl}/messages`,
               health: `${baseUrl}/health`,
+              update: `${baseUrl}/update`,
               login_cookies: `${baseUrl}/login`,
               restart_browser: `${baseUrl}/restart-browser`,
             },
@@ -249,6 +253,16 @@ const httpServer = http.createServer(async (req, res) => {
       return;
     }
 
+    if (pathname === '/update' && (req.method === 'POST' || req.method === 'GET')) {
+      const result = await autoUpdate();
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify(result, null, 2));
+      if (result.updated) {
+        setTimeout(() => process.exit(75), 500);
+      }
+      return;
+    }
+
     if (pathname === '/login' && req.method === 'POST') {
       const body = (await readJsonBody(req)) || {};
       const result = await injectTradingViewCookies({
@@ -284,6 +298,7 @@ httpServer.listen(PORT, HOST, () => {
   console.log(`   • Streamable HTTP MCP : http://${HOST}:${PORT}/mcp (or /)`);
   console.log(`   • SSE MCP             : http://${HOST}:${PORT}/sse`);
   console.log(`   • Health & Status     : http://${HOST}:${PORT}/health`);
+  console.log(`   • Auto-Update Trigger : http://${HOST}:${PORT}/update`);
   console.log(`   • Tools registered    : 84 tools (full tradingview-mcp)`);
   console.log(`=============================================================`);
 

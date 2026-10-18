@@ -21,6 +21,14 @@ function _resolve(deps) {
 }
 
 export async function update({ _deps } = {}) {
+  if (!_deps) {
+    const { autoUpdate } = await import('../auto-update.js');
+    const res = await autoUpdate();
+    if (res.updated) {
+      setTimeout(() => process.exit(75), 800);
+    }
+    return res;
+  }
   const { execSync, existsSync, repoRoot } = _resolve(_deps);
   const git = (args, timeout = 15000) =>
     execSync(`git ${args}`, { cwd: repoRoot, timeout, stdio: ['ignore', 'pipe', 'pipe'] }).toString().trim();
