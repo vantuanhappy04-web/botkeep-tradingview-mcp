@@ -6,10 +6,13 @@ import {
   unlinkSync,
   statfsSync,
   writeFileSync,
+  readFileSync,
+  symlinkSync,
 } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { tmpdir, totalmem, freemem } from 'node:os';
 import { join, dirname } from 'node:path';
-import { spawn, execSync } from 'node:child_process';
+import { spawn, execSync, execFileSync } from 'node:child_process';
+import { brotliDecompressSync } from 'node:zlib';
 import { fileURLToPath } from 'node:url';
 import CDP from 'chrome-remote-interface';
 import { CDP_HOST, CDP_PORT, disconnect } from './connection.js';
@@ -114,13 +117,19 @@ async function resolveSparticuzChromium() {
   process.env.TMPDIR = runtimeDir;
   process.env.TMP = runtimeDir;
   process.env.TEMP = runtimeDir;
-  process.env.VERCEL = '1';
+  process.env.HOME = runtimeDir;
+  process.env.XDG_CACHE_HOME = join(runtimeDir, 'cache');
+  process.env.XDG_CONFIG_HOME = join(runtimeDir, 'config');
+  process.env.NSS_SDB_USE_CACHE = 'yes';
+  mkdirSync(process.env.XDG_CACHE_HOME, { recursive: true });
+  mkdirSync(process.env.XDG_CONFIG_HOME, { recursive: true });
+  mkdirSync(join(runtimeDir, '.pki', 'nssdb'), { recursive: true });
 
   const binDir = join(__dirname, '..', 'node_modules', '@sparticuz', 'chromium', 'bin');
   const { inflate, setupLambdaEnvironment } = await import('@sparticuz/chromium');
 
   console.log(`[tv-browser] Extracting headless Chromium into ${runtimeDir} ...`);
-  const [chromiumPath, , , al2023Path] = await Promise.all([
+  const [chromiumPath, fontsOutPath, , al2023Path] = await Promise.all([
     inflate(join(binDir, 'chromium.br')),
     inflate(join(binDir, 'fonts.tar.br')),
     inflate(join(binDir, 'swiftshader.tar.br')),
@@ -129,9 +138,60 @@ async function resolveSparticuzChromium() {
 
   chmodSync(chromiumPath, 0o755);
   const al2023Lib = join(al2023Path, 'lib');
+  mkdirSync(al2023Lib, { recursive: true });
+
+  // 1. Extract bundled libsqlite3.so.0 into al2023/lib so libsoftokn3.so (NSS HTTPS/TLS) never fails dlopen on Debian Slim containers
+  const bundledSqliteBr = join(__dirname, '..', 'vendor', 'libsqlite3.so.0.br');
+  const targetSqliteSo = join(al2023Lib, 'libsqlite3.so.0');
+  if (existsSync(bundledSqliteBr) && !existsSync(targetSqliteSo)) {
+    try {
+      const rawSqlite = brotliDecompressSync(readFileSync(bundledSqliteBr));
+      writeFileSync(targetSqliteSo, rawSqlite, { mode: 0o755 });
+      console.log(`[tv-browser] Installed bundled libsqlite3.so.0 (${Math.round(rawSqlite.length / 1024)} KB) into ${al2023Lib}`);
+    } catch (e) {
+      console.warn('[tv-browser] Failed extracting vendor/libsqlite3.so.0.br:', e.message);
+    }
+  }
+
   setupLambdaEnvironment(al2023Lib);
 
-  // Fix vk_swiftshader_icd.json to point to absolute path of libvk_swiftshader.so
+  // 2. Fix fonts.conf! @sparticuz/chromium hardcodes /tmp/fonts inside fonts.conf.
+  // When runtimeDir is /home/container/.tv-chromium, Fontconfig finds 0 fonts and Blink hits CHECK(last_resort_font) -> SIGTRAP on first page text!
+  const fontsDir = fontsOutPath || join(runtimeDir, 'fonts');
+  const fontsCacheDir = join(runtimeDir, 'fonts-cache');
+  mkdirSync(fontsCacheDir, { recursive: true });
+  try {
+    if (!existsSync('/tmp/fonts')) {
+      symlinkSync(fontsDir, '/tmp/fonts');
+    }
+    mkdirSync('/tmp/fonts-cache', { recursive: true });
+  } catch {}
+
+  const fontsConfPath = join(fontsDir, 'fonts.conf');
+  const fontsSubDir = join(fontsDir, 'fonts');
+  const openSansDir = join(fontsSubDir, 'Open_Sans');
+  const fixedFontsConf = `<?xml version="1.0" ?>
+<!DOCTYPE fontconfig SYSTEM "fonts.dtd">
+<fontconfig>
+  <dir>${fontsDir}</dir>
+  <dir>${fontsSubDir}</dir>
+  <dir>${openSansDir}</dir>
+  <dir>/tmp/fonts</dir>
+  <dir>/usr/share/fonts</dir>
+  <dir>/usr/local/share/fonts</dir>
+  <cachedir>${fontsCacheDir}</cachedir>
+  <config></config>
+</fontconfig>
+`;
+  try {
+    writeFileSync(fontsConfPath, fixedFontsConf, 'utf8');
+  } catch (e) {
+    console.warn('[tv-browser] Could not rewrite fonts.conf:', e.message);
+  }
+  process.env.FONTCONFIG_PATH = fontsDir;
+  process.env.FONTCONFIG_FILE = fontsConfPath;
+
+  // 3. Fix vk_swiftshader_icd.json to point to absolute path of libvk_swiftshader.so
   const icdPath = join(runtimeDir, 'vk_swiftshader_icd.json');
   const vkLibPath = join(runtimeDir, 'libvk_swiftshader.so');
   try {
@@ -149,10 +209,33 @@ async function resolveSparticuzChromium() {
   const ldParts = [
     al2023Lib,
     runtimeDir,
+    '/usr/lib/x86_64-linux-gnu',
+    '/lib/x86_64-linux-gnu',
+    '/usr/lib64',
+    '/lib64',
     ...(process.env.LD_LIBRARY_PATH ? process.env.LD_LIBRARY_PATH.split(':') : []),
   ].filter(Boolean);
   process.env.LD_LIBRARY_PATH = [...new Set(ldParts)].join(':');
-  process.env.FONTCONFIG_PATH = join(runtimeDir, 'fonts');
+
+  // 4. Quick container diagnostics (RAM, cgroup limit, missing .so check)
+  try {
+    let cgroupMem = 'unknown';
+    for (const cgPath of ['/sys/fs/cgroup/memory.max', '/sys/fs/cgroup/memory/memory.limit_in_bytes']) {
+      if (existsSync(cgPath)) {
+        cgroupMem = readFileSync(cgPath, 'utf8').trim();
+        break;
+      }
+    }
+    console.log(
+      `[tv-browser] Host RAM free=${Math.round(freemem() / 1048576)}MB/${Math.round(totalmem() / 1048576)}MB, cgroup.mem=${cgroupMem}`
+    );
+    const lddChr = execFileSync('ldd', [chromiumPath], { env: process.env, encoding: 'utf8' });
+    const missChr = lddChr.split('\n').filter((l) => l.includes('not found'));
+    if (missChr.length) console.warn('[tv-browser] Missing libs (chromium):', missChr.join(' | '));
+    const lddSoft = execFileSync('ldd', [join(al2023Lib, 'libsoftokn3.so')], { env: process.env, encoding: 'utf8' });
+    const missSoft = lddSoft.split('\n').filter((l) => l.includes('not found'));
+    if (missSoft.length) console.warn('[tv-browser] Missing libs (libsoftokn3.so):', missSoft.join(' | '));
+  } catch {}
 
   return { binary: chromiumPath, runtimeDir, isSparticuz: true };
 }
@@ -206,6 +289,10 @@ function getLaunchProfiles({ profileDir, cdpPort, isSparticuz }) {
     '--no-sandbox',
     '--disable-setuid-sandbox',
     '--disable-dev-shm-usage',
+    '--disable-breakpad',
+    '--disable-crash-reporter',
+    '--enable-logging=stderr',
+    '--log-level=0',
     '--no-first-run',
     '--no-default-browser-check',
     '--no-pings',
@@ -232,40 +319,8 @@ function getLaunchProfiles({ profileDir, cdpPort, isSparticuz }) {
 
   return [
     {
-      name: 'multiprocess-2d-zygote',
-      args: [
-        ...baseCommon,
-        '--disable-gpu',
-        '--disable-webgl',
-        '--disable-3d-apis',
-        '--disable-gpu-compositing',
-        '--disable-software-rasterizer',
-        '--disable-features=AudioServiceOutOfProcess,IsolateOrigins,site-per-process,Vulkan,UseDisplayCompositor',
-        '--js-flags=--max-old-space-size=768',
-        `--user-data-dir=${join(profileDir, 'p1')}`,
-        'about:blank',
-      ],
-    },
-    {
-      name: 'single-process-2d',
-      args: [
-        ...baseCommon,
-        '--no-zygote',
-        '--single-process',
-        '--in-process-gpu',
-        '--disable-gpu',
-        '--disable-webgl',
-        '--disable-3d-apis',
-        '--disable-gpu-compositing',
-        '--disable-features=AudioServiceOutOfProcess,IsolateOrigins,site-per-process,Vulkan',
-        '--enable-features=SharedArrayBuffer',
-        '--js-flags=--max-old-space-size=768',
-        `--user-data-dir=${join(profileDir, 'p2')}`,
-        'about:blank',
-      ],
-    },
-    {
       name: 'single-process-swiftshader',
+      directUrl: true,
       args: [
         ...baseCommon,
         '--no-zygote',
@@ -277,9 +332,49 @@ function getLaunchProfiles({ profileDir, cdpPort, isSparticuz }) {
         '--enable-unsafe-swiftshader',
         '--disable-features=AudioServiceOutOfProcess,IsolateOrigins,site-per-process',
         '--enable-features=SharedArrayBuffer',
-        '--js-flags=--max-old-space-size=768',
+        '--num-raster-threads=1',
+        '--js-flags=--max-old-space-size=384',
+        `--user-data-dir=${join(profileDir, 'p1')}`,
+        CHART_URL,
+      ],
+    },
+    {
+      name: 'single-process-2d',
+      directUrl: true,
+      args: [
+        ...baseCommon,
+        '--no-zygote',
+        '--single-process',
+        '--in-process-gpu',
+        '--disable-gpu',
+        '--disable-webgl',
+        '--disable-3d-apis',
+        '--disable-gpu-compositing',
+        '--disable-accelerated-2d-canvas',
+        '--disable-features=AudioServiceOutOfProcess,IsolateOrigins,site-per-process,Vulkan',
+        '--enable-features=SharedArrayBuffer',
+        '--num-raster-threads=1',
+        '--js-flags=--max-old-space-size=384',
+        `--user-data-dir=${join(profileDir, 'p2')}`,
+        CHART_URL,
+      ],
+    },
+    {
+      name: 'multiprocess-2d-zygote',
+      directUrl: true,
+      args: [
+        ...baseCommon,
+        '--disable-gpu',
+        '--disable-webgl',
+        '--disable-3d-apis',
+        '--disable-gpu-compositing',
+        '--disable-software-rasterizer',
+        '--renderer-process-limit=1',
+        '--num-raster-threads=1',
+        '--disable-features=AudioServiceOutOfProcess,IsolateOrigins,site-per-process,Vulkan,UseDisplayCompositor',
+        '--js-flags=--max-old-space-size=384',
         `--user-data-dir=${join(profileDir, 'p3')}`,
-        'about:blank',
+        CHART_URL,
       ],
     },
   ];
@@ -367,57 +462,47 @@ async function tryLaunchProfile({ binary, profile, cdpPort }) {
     return { ok: false, error: `CDP timeout (${stderrTail.trim().slice(-400)})` };
   }
 
-  // 2. Attach to the about:blank page, block heavy third-party trackers, optional cookies, then navigate to CHART_URL
-  try {
-    const targets = await listCdpTargets(cdpPort);
-    const pageTarget = targets.find((t) => t.type === 'page');
-    if (pageTarget) {
-      const c = await CDP({ host: CDP_HOST, port: cdpPort, target: pageTarget.id });
-      try {
-        await c.Network.enable();
-        await c.Network.setBlockedURLs({
-          urls: [
-            '*google-analytics.com*',
-            '*googletagmanager.com*',
-            '*doubleclick.net*',
-            '*googlesyndication.com*',
-            '*snowplow*',
-            '*sentry.io*',
-            '*facebook.net*',
-            '*bing.com*',
-          ],
-        });
-        if (process.env.TV_SESSIONID) {
-          await c.Network.setCookie({
-            name: 'sessionid',
-            value: process.env.TV_SESSIONID,
-            domain: '.tradingview.com',
-            path: '/',
-            secure: true,
-            httpOnly: true,
-            sameSite: 'Lax',
-          });
-          if (process.env.TV_SESSIONID_SIGN) {
+  // 2. If TV_SESSIONID is configured (or profile launched about:blank), inject cookies and navigate
+  if (process.env.TV_SESSIONID || !profile.directUrl) {
+    try {
+      const targets = await listCdpTargets(cdpPort);
+      const pageTarget = targets.find((t) => t.type === 'page');
+      if (pageTarget) {
+        const c = await CDP({ host: CDP_HOST, port: cdpPort, target: pageTarget.id });
+        try {
+          await c.Network.enable();
+          if (process.env.TV_SESSIONID) {
             await c.Network.setCookie({
-              name: 'sessionid_sign',
-              value: process.env.TV_SESSIONID_SIGN,
+              name: 'sessionid',
+              value: process.env.TV_SESSIONID,
               domain: '.tradingview.com',
               path: '/',
               secure: true,
               httpOnly: true,
               sameSite: 'Lax',
             });
+            if (process.env.TV_SESSIONID_SIGN) {
+              await c.Network.setCookie({
+                name: 'sessionid_sign',
+                value: process.env.TV_SESSIONID_SIGN,
+                domain: '.tradingview.com',
+                path: '/',
+                secure: true,
+                httpOnly: true,
+                sameSite: 'Lax',
+              });
+            }
+            browserState.loggedInCookieInjected = true;
           }
-          browserState.loggedInCookieInjected = true;
+          await c.Page.enable();
+          await c.Page.navigate({ url: CHART_URL });
+        } finally {
+          try { await c.close(); } catch {}
         }
-        await c.Page.enable();
-        await c.Page.navigate({ url: CHART_URL });
-      } finally {
-        try { await c.close(); } catch {}
       }
+    } catch (e) {
+      console.warn(`[tv-browser] Pre-navigation warning (${profile.name}):`, e.message);
     }
-  } catch (e) {
-    console.warn(`[tv-browser] Pre-navigation warning (${profile.name}):`, e.message);
   }
 
   // 3. Wait up to 25s for window.TradingViewApi._activeChartWidgetWV.value() AND verify child hasn't crashed!
