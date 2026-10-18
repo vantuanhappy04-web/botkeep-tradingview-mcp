@@ -28,7 +28,7 @@
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.12.1",
-    "@sparticuz/chromium": "^153.0.0",
+    "@sparticuz/chromium": "131.0.1",
     "chrome-remote-interface": "^0.33.2"
   },
   "devDependencies": {

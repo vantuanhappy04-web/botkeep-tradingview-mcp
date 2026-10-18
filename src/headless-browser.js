@@ -5,15 +5,20 @@ import {
   copyFileSync,
   unlinkSync,
   statfsSync,
+  statSync,
+  rmSync,
   writeFileSync,
   readFileSync,
   symlinkSync,
+  createReadStream,
+  createWriteStream,
 } from 'node:fs';
 import { tmpdir, totalmem, freemem } from 'node:os';
-import { join, dirname } from 'node:path';
+import { join, dirname, basename } from 'node:path';
 import { spawn, execSync, execFileSync } from 'node:child_process';
-import { brotliDecompressSync } from 'node:zlib';
+import { brotliDecompressSync, createBrotliDecompress, createUnzip } from 'node:zlib';
 import { fileURLToPath } from 'node:url';
+import { extract } from 'tar-fs';
 import CDP from 'chrome-remote-interface';
 import { CDP_HOST, CDP_PORT, disconnect } from './connection.js';
 
@@ -91,11 +96,20 @@ function getFreeMb(dir) {
 }
 
 function pickRuntimeDir() {
+  // Clean up old .tv-chromium directory that cached broken 153.0.0 binaries (318KB libGLESv2.so stub)
+  for (const staleDir of ['/tmp/tv-chromium', join(process.cwd(), '.tv-chromium')]) {
+    try {
+      if (existsSync(staleDir)) {
+        rmSync(staleDir, { recursive: true, force: true });
+      }
+    } catch {}
+  }
+
   const candidates = [
     process.env.TV_RUNTIME_DIR,
-    '/tmp/tv-chromium',
-    join(process.cwd(), '.tv-chromium'),
-    process.env.HOME ? join(process.env.HOME, '.cache', 'tv-chromium') : null,
+    '/tmp/tv-chromium-131',
+    join(process.cwd(), '.tv-chromium-131'),
+    process.env.HOME ? join(process.env.HOME, '.cache', 'tv-chromium-131') : null,
   ].filter(Boolean);
 
   for (const dir of candidates) {
@@ -107,12 +121,82 @@ function pickRuntimeDir() {
       }
     } catch {}
   }
-  const fallback = join(tmpdir(), 'tv-chromium');
+  const fallback = join(tmpdir(), 'tv-chromium-131');
   mkdirSync(fallback, { recursive: true });
   return fallback;
 }
 
+function inflateArchive(filePath, baseDir) {
+  const isSwiftshader = filePath.includes('swiftshader');
+  const outName = basename(filePath).replace(/\.(?:t(?:ar(?:\.(?:br|gz))?|br|gz)|br|gz)$/i, '');
+  const output = isSwiftshader ? baseDir : join(baseDir, outName);
+
+  return new Promise((resolve, reject) => {
+    if (isSwiftshader) {
+      const glesPath = join(output, 'libGLESv2.so');
+      // Only reuse cached swiftshader if libGLESv2.so is the real ~8MB ANGLE library (not 153.0.0's 318KB stub)
+      if (existsSync(glesPath) && statSync(glesPath).size > 4000000) {
+        return resolve(output);
+      }
+    } else if (existsSync(output)) {
+      return resolve(output);
+    }
+
+    const isTar = /\.t(?:ar(?:\.(?:br|gz))?|br|gz)$/i.test(filePath);
+    const isBrotli = /br$/i.test(filePath);
+    const isGzip = /gz$/i.test(filePath);
+
+    const source = createReadStream(filePath, { highWaterMark: 2 ** 22 });
+    const target = isTar ? extract(output) : createWriteStream(output, { mode: 0o755 });
+
+    source.once('error', reject);
+    target.once('error', reject);
+    if (isTar) {
+      target.once('finish', () => resolve(output));
+    } else {
+      target.once('close', () => resolve(output));
+    }
+
+    if (isBrotli || isGzip) {
+      const decompressor = isBrotli
+        ? createBrotliDecompress({ chunkSize: 2 ** 21 })
+        : createUnzip({ chunkSize: 2 ** 21 });
+      decompressor.once('error', reject);
+      source.pipe(decompressor).pipe(target);
+    } else {
+      source.pipe(target);
+    }
+  });
+}
+
+function ensureSparticuz131Installed() {
+  const repoRoot = join(__dirname, '..');
+  const pkgPath = join(repoRoot, 'node_modules', '@sparticuz', 'chromium', 'package.json');
+  let ver = 'none';
+  try {
+    if (existsSync(pkgPath)) {
+      ver = JSON.parse(readFileSync(pkgPath, 'utf8')).version || 'unknown';
+    }
+  } catch {}
+
+  if (ver !== '131.0.1') {
+    console.log(`[tv-browser] Replacing @sparticuz/chromium@${ver} with stable 131.0.1 (fixes broken 318KB libGLESv2.so in 153.0.0)...`);
+    try {
+      execSync('npm install @sparticuz/chromium@131.0.1 --no-save --no-audit --no-fund', {
+        cwd: repoRoot,
+        stdio: 'inherit',
+        timeout: 180000,
+      });
+      ver = '131.0.1';
+    } catch (e) {
+      console.warn('[tv-browser] npm install @sparticuz/chromium@131.0.1 warning:', e.message);
+    }
+  }
+  return ver;
+}
+
 async function resolveSparticuzChromium() {
+  const sparticuzVer = ensureSparticuz131Installed();
   const runtimeDir = pickRuntimeDir();
   process.env.TMPDIR = runtimeDir;
   process.env.TMP = runtimeDir;
@@ -126,14 +210,13 @@ async function resolveSparticuzChromium() {
   mkdirSync(join(runtimeDir, '.pki', 'nssdb'), { recursive: true });
 
   const binDir = join(__dirname, '..', 'node_modules', '@sparticuz', 'chromium', 'bin');
-  const { inflate, setupLambdaEnvironment } = await import('@sparticuz/chromium');
 
-  console.log(`[tv-browser] Extracting headless Chromium into ${runtimeDir} ...`);
+  console.log(`[tv-browser] Extracting headless Chromium (@sparticuz/chromium@${sparticuzVer}) into ${runtimeDir} ...`);
   const [chromiumPath, fontsOutPath, , al2023Path] = await Promise.all([
-    inflate(join(binDir, 'chromium.br')),
-    inflate(join(binDir, 'fonts.tar.br')),
-    inflate(join(binDir, 'swiftshader.tar.br')),
-    inflate(join(binDir, 'al2023.tar.br')),
+    inflateArchive(join(binDir, 'chromium.br'), runtimeDir),
+    inflateArchive(join(binDir, 'fonts.tar.br'), runtimeDir),
+    inflateArchive(join(binDir, 'swiftshader.tar.br'), runtimeDir),
+    inflateArchive(join(binDir, 'al2023.tar.br'), runtimeDir),
   ]);
 
   chmodSync(chromiumPath, 0o755);
@@ -147,16 +230,12 @@ async function resolveSparticuzChromium() {
     try {
       const rawSqlite = brotliDecompressSync(readFileSync(bundledSqliteBr));
       writeFileSync(targetSqliteSo, rawSqlite, { mode: 0o755 });
-      console.log(`[tv-browser] Installed bundled libsqlite3.so.0 (${Math.round(rawSqlite.length / 1024)} KB) into ${al2023Lib}`);
     } catch (e) {
       console.warn('[tv-browser] Failed extracting vendor/libsqlite3.so.0.br:', e.message);
     }
   }
 
-  setupLambdaEnvironment(al2023Lib);
-
   // 2. Fix fonts.conf! @sparticuz/chromium hardcodes /tmp/fonts inside fonts.conf.
-  // When runtimeDir is /home/container/.tv-chromium, Fontconfig finds 0 fonts and Blink hits CHECK(last_resort_font) -> SIGTRAP on first page text!
   const fontsDir = fontsOutPath || join(runtimeDir, 'fonts');
   const fontsCacheDir = join(runtimeDir, 'fonts-cache');
   mkdirSync(fontsCacheDir, { recursive: true });
@@ -207,8 +286,8 @@ async function resolveSparticuzChromium() {
   } catch {}
 
   const ldParts = [
-    al2023Lib,
     runtimeDir,
+    al2023Lib,
     '/usr/lib/x86_64-linux-gnu',
     '/lib/x86_64-linux-gnu',
     '/usr/lib64',
@@ -217,37 +296,14 @@ async function resolveSparticuzChromium() {
   ].filter(Boolean);
   process.env.LD_LIBRARY_PATH = [...new Set(ldParts)].join(':');
 
-  // 4. Quick container diagnostics (RAM, cgroup limit, limits, missing .so check)
+  // 4. Quick container diagnostics
   try {
-    let cgroupMem = 'unknown';
-    for (const cgPath of ['/sys/fs/cgroup/memory.max', '/sys/fs/cgroup/memory/memory.limit_in_bytes']) {
-      if (existsSync(cgPath)) {
-        cgroupMem = readFileSync(cgPath, 'utf8').trim();
-        break;
-      }
-    }
-    let cgroupPids = 'unknown';
-    for (const pidPath of ['/sys/fs/cgroup/pids.max', '/sys/fs/cgroup/pids/pids.max']) {
-      if (existsSync(pidPath)) {
-        cgroupPids = readFileSync(pidPath, 'utf8').trim();
-        break;
-      }
-    }
-    let vmemLimit = 'unknown';
-    if (existsSync('/proc/self/limits')) {
-      const lim = readFileSync('/proc/self/limits', 'utf8');
-      const m = lim.split('\n').find((l) => l.startsWith('Max address space'));
-      if (m) vmemLimit = m.replace(/\s+/g, ' ').trim();
-    }
+    const glesSizeKb = existsSync(join(runtimeDir, 'libGLESv2.so'))
+      ? Math.round(statSync(join(runtimeDir, 'libGLESv2.so')).size / 1024)
+      : 0;
     console.log(
-      `[tv-browser] Host RAM free=${Math.round(freemem() / 1048576)}MB/${Math.round(totalmem() / 1048576)}MB, cgroup.mem=${cgroupMem}, pids.max=${cgroupPids}, sqlite3=${existsSync(targetSqliteSo)}, ${vmemLimit}`
+      `[tv-browser] Diagnostics: sparticuz=${sparticuzVer}, libGLESv2=${glesSizeKb}KB, sqlite3=${existsSync(targetSqliteSo)}, RAM=${Math.round(freemem() / 1048576)}MB`
     );
-    const lddChr = execFileSync('ldd', [chromiumPath], { env: process.env, encoding: 'utf8' });
-    const missChr = lddChr.split('\n').filter((l) => l.includes('not found'));
-    if (missChr.length) console.warn('[tv-browser] Missing libs (chromium):', missChr.join(' | '));
-    const lddSoft = execFileSync('ldd', [join(al2023Lib, 'libsoftokn3.so')], { env: process.env, encoding: 'utf8' });
-    const missSoft = lddSoft.split('\n').filter((l) => l.includes('not found'));
-    if (missSoft.length) console.warn('[tv-browser] Missing libs (libsoftokn3.so):', missSoft.join(' | '));
   } catch {}
 
   return { binary: chromiumPath, runtimeDir, isSparticuz: true };
@@ -297,109 +353,100 @@ async function findBrowserBinary() {
 }
 
 function getLaunchProfiles({ profileDir, cdpPort, isSparticuz }) {
+  // Exact @sparticuz/chromium@131.0.1 tested flags (SwiftShader ANGLE must be enabled; see Sparticuz/chromium#247)
   const baseCommon = [
     isSparticuz ? '--headless=shell' : '--headless=new',
-    '--no-sandbox',
-    '--disable-setuid-sandbox',
-    '--disable-seccomp-filter-sandbox',
-    '--disable-namespace-sandbox',
-    '--disable-dev-shm-usage',
-    '--disable-breakpad',
-    '--disable-crash-reporter',
-    '--enable-logging=stderr',
-    '--log-level=0',
-    '--no-first-run',
-    '--no-default-browser-check',
-    '--no-pings',
+    '--allow-pre-commit-input',
     '--disable-background-networking',
+    '--disable-background-timer-throttling',
+    '--disable-backgrounding-occluded-windows',
+    '--disable-breakpad',
+    '--disable-client-side-phishing-detection',
+    '--disable-component-extensions-with-background-pages',
+    '--disable-component-update',
     '--disable-default-apps',
+    '--disable-dev-shm-usage',
     '--disable-extensions',
+    '--disable-hang-monitor',
+    '--disable-ipc-flooding-protection',
+    '--disable-popup-blocking',
+    '--disable-prompt-on-repost',
+    '--disable-renderer-backgrounding',
     '--disable-sync',
-    '--disable-translate',
+    '--enable-automation',
+    '--enable-blink-features=IdleDetection',
+    '--export-tagged-pdf',
+    '--force-color-profile=srgb',
+    '--metrics-recording-only',
+    '--no-first-run',
+    '--password-store=basic',
+    '--use-mock-keychain',
     '--disable-domain-reliability',
     '--disable-print-preview',
-    '--metrics-recording-only',
-    '--mute-audio',
-    '--ash-no-nudges',
+    '--disable-speech-api',
     '--disk-cache-size=33554432',
+    '--mute-audio',
+    '--no-default-browser-check',
+    '--no-pings',
     '--font-render-hinting=none',
+    '--hide-scrollbars',
+    '--ignore-gpu-blocklist',
+    '--in-process-gpu',
+    '--window-size=1920,1080',
+    '--use-gl=angle',
+    '--use-angle=swiftshader',
     '--allow-running-insecure-content',
+    '--disable-setuid-sandbox',
     '--disable-site-isolation-trials',
     '--disable-web-security',
-    '--window-size=1920,1080',
+    '--no-sandbox',
     '--user-agent=Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
     `--remote-debugging-port=${cdpPort}`,
     '--remote-debugging-address=127.0.0.1',
   ];
 
-  const disableFeatures = [
+  const stdDisable = [
+    'Translate',
+    'BackForwardCache',
+    'AcceptCHFrame',
+    'MediaRouter',
+    'OptimizationHints',
     'AudioServiceOutOfProcess',
-    'AudioServiceSandbox',
     'IsolateOrigins',
     'site-per-process',
-    'WebAssemblyTrapHandler',
-    'WebAssemblyTiering',
-    'WebAssemblyDynamicTiering',
-    'WebAssemblyLazyCompilation',
-    'BackForwardCache',
-  ].join(',');
-
-  const enableFeatures = ['NetworkServiceInProcess2', 'TracingServiceInProcess'].join(',');
+  ];
 
   return [
     {
-      name: 'single-process-2d-nowasmtrap',
+      name: 'sparticuz-131-official',
       args: [
         ...baseCommon,
-        '--no-zygote',
         '--single-process',
-        '--in-process-gpu',
-        '--disable-gpu',
-        '--disable-webgl',
-        '--disable-3d-apis',
-        '--disable-gpu-compositing',
-        '--disable-accelerated-2d-canvas',
-        `--disable-features=${disableFeatures},Vulkan`,
-        `--enable-features=${enableFeatures}`,
-        '--num-raster-threads=1',
-        '--js-flags=--no-wasm-tier-up --no-wasm-dynamic-tiering --no-wasm-lazy-compilation',
+        '--no-zygote',
+        `--disable-features=${stdDisable.join(',')}`,
+        '--enable-features=NetworkServiceInProcess2,SharedArrayBuffer',
         `--user-data-dir=${join(profileDir, 'p1')}`,
         'about:blank',
       ],
     },
     {
-      name: 'single-process-swiftshader-nowasmtrap',
+      name: 'sparticuz-131-nowasmtrap',
       args: [
         ...baseCommon,
-        '--no-zygote',
         '--single-process',
-        '--in-process-gpu',
-        '--ignore-gpu-blocklist',
-        '--use-gl=angle',
-        '--use-angle=swiftshader',
-        '--enable-unsafe-swiftshader',
-        `--disable-features=${disableFeatures}`,
-        `--enable-features=${enableFeatures}`,
-        '--num-raster-threads=1',
-        '--js-flags=--no-wasm-tier-up --no-wasm-dynamic-tiering --no-wasm-lazy-compilation',
+        '--no-zygote',
+        `--disable-features=${[...stdDisable, 'WebAssemblyTrapHandler', 'WebAssemblyTiering', 'WebAssemblyLazyCompilation'].join(',')}`,
+        '--enable-features=NetworkServiceInProcess2',
         `--user-data-dir=${join(profileDir, 'p2')}`,
         'about:blank',
       ],
     },
     {
-      name: 'multiprocess-inproc-net',
+      name: 'sparticuz-131-multiprocess',
       args: [
         ...baseCommon,
-        '--in-process-gpu',
-        '--disable-gpu',
-        '--disable-webgl',
-        '--disable-3d-apis',
-        '--disable-gpu-compositing',
-        '--renderer-process-limit=1',
-        '--num-raster-threads=1',
-        `--disable-features=${disableFeatures},Vulkan,UseDisplayCompositor`,
-        `--enable-features=${enableFeatures}`,
-        '--js-flags=--no-wasm-tier-up --no-wasm-dynamic-tiering --no-wasm-lazy-compilation',
+        `--disable-features=${[...stdDisable, 'WebAssemblyTrapHandler'].join(',')}`,
+        '--enable-features=NetworkServiceInProcess2',
         `--user-data-dir=${join(profileDir, 'p3')}`,
         'about:blank',
       ],
