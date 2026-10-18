@@ -1,4 +1,12 @@
-import { existsSync, mkdirSync, chmodSync, copyFileSync, unlinkSync, statfsSync } from 'node:fs';
+import {
+  existsSync,
+  mkdirSync,
+  chmodSync,
+  copyFileSync,
+  unlinkSync,
+  statfsSync,
+  writeFileSync,
+} from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { spawn, execSync } from 'node:child_process';
@@ -123,6 +131,21 @@ async function resolveSparticuzChromium() {
   const al2023Lib = join(al2023Path, 'lib');
   setupLambdaEnvironment(al2023Lib);
 
+  // Fix vk_swiftshader_icd.json to point to absolute path of libvk_swiftshader.so
+  const icdPath = join(runtimeDir, 'vk_swiftshader_icd.json');
+  const vkLibPath = join(runtimeDir, 'libvk_swiftshader.so');
+  try {
+    writeFileSync(
+      icdPath,
+      JSON.stringify({
+        file_format_version: '1.0.0',
+        ICD: { library_path: vkLibPath, api_version: '1.0.5' },
+      })
+    );
+    process.env.VK_ICD_FILENAMES = icdPath;
+    process.env.VK_DRIVER_FILES = icdPath;
+  } catch {}
+
   const ldParts = [
     al2023Lib,
     runtimeDir,
@@ -177,82 +200,89 @@ async function findBrowserBinary() {
   throw new Error('No Chromium/Chrome binary found.');
 }
 
-function buildFlags({ profileDir, cdpPort, isSparticuz, singleProcess }) {
-  const common = [
+function getLaunchProfiles({ profileDir, cdpPort, isSparticuz }) {
+  const baseCommon = [
     isSparticuz ? '--headless=shell' : '--headless=new',
     '--no-sandbox',
-    '--no-zygote',
     '--disable-setuid-sandbox',
     '--disable-dev-shm-usage',
-    '--disable-gpu',
-    '--in-process-gpu',
-    '--ignore-gpu-blocklist',
-    '--use-gl=angle',
-    '--use-angle=swiftshader',
-    '--enable-unsafe-swiftshader',
     '--no-first-run',
     '--no-default-browser-check',
+    '--no-pings',
     '--disable-background-networking',
     '--disable-default-apps',
     '--disable-extensions',
     '--disable-sync',
     '--disable-translate',
+    '--disable-domain-reliability',
+    '--disable-print-preview',
     '--metrics-recording-only',
     '--mute-audio',
-    '--no-pings',
+    '--ash-no-nudges',
     '--disk-cache-size=33554432',
     '--font-render-hinting=none',
     '--allow-running-insecure-content',
     '--disable-site-isolation-trials',
     '--disable-web-security',
-    '--disable-features=AudioServiceOutOfProcess,IsolateOrigins,site-per-process',
-    '--enable-features=SharedArrayBuffer',
     '--window-size=1920,1080',
-    '--user-agent=Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) TradingView/2.9.0 Chrome/131.0.0.0 Electron/33.0.0 Safari/537.36',
-    `--user-data-dir=${profileDir}`,
+    '--user-agent=Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
     `--remote-debugging-port=${cdpPort}`,
     '--remote-debugging-address=127.0.0.1',
   ];
-  if (singleProcess) {
-    common.push('--single-process');
-  }
-  common.push(CHART_URL);
-  return common;
-}
 
-async function spawnAndWaitCdp({ binary, args, cdpPort, timeoutMs = 15000 }) {
-  const child = spawn(binary, args, {
-    stdio: ['ignore', 'pipe', 'pipe'],
-    env: { ...process.env },
-  });
-
-  let stderrTail = '';
-  child.stderr?.on('data', (chunk) => {
-    stderrTail = (stderrTail + chunk.toString()).slice(-1500);
-  });
-
-  let exited = null;
-  child.on('exit', (code, signal) => {
-    exited = { code, signal };
-  });
-  child.on('error', (err) => {
-    exited = { error: err.message };
-  });
-
-  const deadline = Date.now() + timeoutMs;
-  while (Date.now() < deadline) {
-    if (exited) {
-      return { ok: false, child, error: `Process exited (${JSON.stringify(exited)}): ${stderrTail.trim()}` };
-    }
-    const ver = await probeCdpVersion(cdpPort);
-    if (ver) {
-      return { ok: true, child, version: ver };
-    }
-    await new Promise((r) => setTimeout(r, 400));
-  }
-
-  try { child.kill('SIGKILL'); } catch {}
-  return { ok: false, child, error: `Timeout waiting for CDP on port ${cdpPort}. Stderr: ${stderrTail.trim()}` };
+  return [
+    {
+      name: 'multiprocess-2d-zygote',
+      args: [
+        ...baseCommon,
+        '--disable-gpu',
+        '--disable-webgl',
+        '--disable-3d-apis',
+        '--disable-gpu-compositing',
+        '--disable-software-rasterizer',
+        '--disable-features=AudioServiceOutOfProcess,IsolateOrigins,site-per-process,Vulkan,UseDisplayCompositor',
+        '--js-flags=--max-old-space-size=768',
+        `--user-data-dir=${join(profileDir, 'p1')}`,
+        'about:blank',
+      ],
+    },
+    {
+      name: 'single-process-2d',
+      args: [
+        ...baseCommon,
+        '--no-zygote',
+        '--single-process',
+        '--in-process-gpu',
+        '--disable-gpu',
+        '--disable-webgl',
+        '--disable-3d-apis',
+        '--disable-gpu-compositing',
+        '--disable-features=AudioServiceOutOfProcess,IsolateOrigins,site-per-process,Vulkan',
+        '--enable-features=SharedArrayBuffer',
+        '--js-flags=--max-old-space-size=768',
+        `--user-data-dir=${join(profileDir, 'p2')}`,
+        'about:blank',
+      ],
+    },
+    {
+      name: 'single-process-swiftshader',
+      args: [
+        ...baseCommon,
+        '--no-zygote',
+        '--single-process',
+        '--in-process-gpu',
+        '--ignore-gpu-blocklist',
+        '--use-gl=angle',
+        '--use-angle=swiftshader',
+        '--enable-unsafe-swiftshader',
+        '--disable-features=AudioServiceOutOfProcess,IsolateOrigins,site-per-process',
+        '--enable-features=SharedArrayBuffer',
+        '--js-flags=--max-old-space-size=768',
+        `--user-data-dir=${join(profileDir, 'p3')}`,
+        'about:blank',
+      ],
+    },
+  ];
 }
 
 export async function injectTradingViewCookies({ sessionid, sessionid_sign, port = CDP_PORT } = {}) {
@@ -296,38 +326,134 @@ export async function injectTradingViewCookies({ sessionid, sessionid_sign, port
   }
 }
 
-async function ensureChartReady(port = CDP_PORT, waitMs = 25000) {
-  let targets = await listCdpTargets(port);
-  let chartTarget = targets.find((t) => t.type === 'page' && /tradingview\.com\/chart/i.test(t.url))
-    || targets.find((t) => t.type === 'page' && /tradingview/i.test(t.url));
+async function tryLaunchProfile({ binary, profile, cdpPort }) {
+  console.log(`[tv-browser] Trying profile "${profile.name}"...`);
+  const child = spawn(binary, profile.args, {
+    stdio: ['ignore', 'pipe', 'pipe'],
+    env: { ...process.env },
+  });
 
-  if (!chartTarget) {
-    try {
-      await fetch(`http://${CDP_HOST}:${port}/json/new?${encodeURIComponent(CHART_URL)}`, { method: 'PUT', signal: AbortSignal.timeout(5000) });
-    } catch {
-      try {
-        await fetch(`http://${CDP_HOST}:${port}/json/new?${encodeURIComponent(CHART_URL)}`, { signal: AbortSignal.timeout(5000) });
-      } catch {}
+  let stderrTail = '';
+  child.stderr?.on('data', (chunk) => {
+    const text = chunk.toString();
+    stderrTail = (stderrTail + text).slice(-1500);
+  });
+
+  let exitInfo = null;
+  child.on('exit', (code, signal) => {
+    exitInfo = { code, signal };
+  });
+  child.on('error', (err) => {
+    exitInfo = { error: err.message };
+  });
+
+  // 1. Wait up to 12s for CDP port to listen on about:blank
+  let version = null;
+  const cdpDeadline = Date.now() + 12000;
+  while (Date.now() < cdpDeadline) {
+    if (exitInfo) {
+      return {
+        ok: false,
+        error: `Exited before CDP ready (${JSON.stringify(exitInfo)}): ${stderrTail.trim().slice(-400)}`,
+      };
     }
+    version = await probeCdpVersion(cdpPort);
+    if (version) break;
+    await new Promise((r) => setTimeout(r, 350));
   }
 
-  const deadline = Date.now() + waitMs;
-  while (Date.now() < deadline) {
-    targets = await listCdpTargets(port);
-    chartTarget = targets.find((t) => t.type === 'page' && /tradingview\.com\/chart/i.test(t.url))
-      || targets.find((t) => t.type === 'page' && /tradingview/i.test(t.url));
+  if (!version) {
+    try { child.kill('SIGKILL'); } catch {}
+    return { ok: false, error: `CDP timeout (${stderrTail.trim().slice(-400)})` };
+  }
+
+  // 2. Attach to the about:blank page, block heavy third-party trackers, optional cookies, then navigate to CHART_URL
+  try {
+    const targets = await listCdpTargets(cdpPort);
+    const pageTarget = targets.find((t) => t.type === 'page');
+    if (pageTarget) {
+      const c = await CDP({ host: CDP_HOST, port: cdpPort, target: pageTarget.id });
+      try {
+        await c.Network.enable();
+        await c.Network.setBlockedURLs({
+          urls: [
+            '*google-analytics.com*',
+            '*googletagmanager.com*',
+            '*doubleclick.net*',
+            '*googlesyndication.com*',
+            '*snowplow*',
+            '*sentry.io*',
+            '*facebook.net*',
+            '*bing.com*',
+          ],
+        });
+        if (process.env.TV_SESSIONID) {
+          await c.Network.setCookie({
+            name: 'sessionid',
+            value: process.env.TV_SESSIONID,
+            domain: '.tradingview.com',
+            path: '/',
+            secure: true,
+            httpOnly: true,
+            sameSite: 'Lax',
+          });
+          if (process.env.TV_SESSIONID_SIGN) {
+            await c.Network.setCookie({
+              name: 'sessionid_sign',
+              value: process.env.TV_SESSIONID_SIGN,
+              domain: '.tradingview.com',
+              path: '/',
+              secure: true,
+              httpOnly: true,
+              sameSite: 'Lax',
+            });
+          }
+          browserState.loggedInCookieInjected = true;
+        }
+        await c.Page.enable();
+        await c.Page.navigate({ url: CHART_URL });
+      } finally {
+        try { await c.close(); } catch {}
+      }
+    }
+  } catch (e) {
+    console.warn(`[tv-browser] Pre-navigation warning (${profile.name}):`, e.message);
+  }
+
+  // 3. Wait up to 25s for window.TradingViewApi._activeChartWidgetWV.value() AND verify child hasn't crashed!
+  const chartDeadline = Date.now() + 25000;
+  let lastTarget = null;
+  while (Date.now() < chartDeadline) {
+    if (exitInfo) {
+      return {
+        ok: false,
+        error: `Crashed while loading TradingView (${JSON.stringify(exitInfo)}): ${stderrTail.trim().slice(-500)}`,
+      };
+    }
+
+    const targets = await listCdpTargets(cdpPort);
+    const chartTarget =
+      targets.find((t) => t.type === 'page' && /tradingview\.com\/chart/i.test(t.url)) ||
+      targets.find((t) => t.type === 'page' && /tradingview/i.test(t.url));
 
     if (chartTarget) {
+      lastTarget = chartTarget;
       let c = null;
       try {
-        c = await CDP({ host: CDP_HOST, port, target: chartTarget.id });
+        c = await CDP({ host: CDP_HOST, port: cdpPort, target: chartTarget.id });
         const { result } = await c.Runtime.evaluate({
           expression: `Boolean(window.TradingViewApi && window.TradingViewApi._activeChartWidgetWV && window.TradingViewApi._activeChartWidgetWV.value())`,
           returnByValue: true,
         });
         await c.close();
         if (result?.value === true) {
-          return { ready: true, target: chartTarget };
+          return {
+            ok: true,
+            child,
+            version,
+            target: chartTarget,
+            chartReady: true,
+          };
         }
       } catch {
         try { if (c) await c.close(); } catch {}
@@ -336,7 +462,22 @@ async function ensureChartReady(port = CDP_PORT, waitMs = 25000) {
     await new Promise((r) => setTimeout(r, 1000));
   }
 
-  return { ready: false, target: chartTarget || null };
+  if (!exitInfo) {
+    // Alive after 25s even if widget still finishing
+    return {
+      ok: true,
+      child,
+      version,
+      target: lastTarget,
+      chartReady: false,
+    };
+  }
+
+  try { child.kill('SIGKILL'); } catch {}
+  return {
+    ok: false,
+    error: `Failed chart init (${JSON.stringify(exitInfo)}): ${stderrTail.trim().slice(-500)}`,
+  };
 }
 
 export async function ensureHeadlessTradingView({ port = CDP_PORT, forceRestart = false } = {}) {
@@ -349,8 +490,9 @@ export async function ensureHeadlessTradingView({ port = CDP_PORT, forceRestart 
       if (!forceRestart) {
         const existingVer = await probeCdpVersion(port);
         if (existingVer) {
-          const check = await ensureChartReady(port, 5000);
-          if (check.ready) {
+          const targets = await listCdpTargets(port);
+          const chartTarget = targets.find((t) => t.type === 'page' && /tradingview/i.test(t.url));
+          if (chartTarget) {
             browserState.status = 'ready';
             browserState.cdpPort = port;
             return {
@@ -359,7 +501,7 @@ export async function ensureHeadlessTradingView({ port = CDP_PORT, forceRestart 
               cdp_port: port,
               cdp_url: `http://${CDP_HOST}:${port}`,
               browser: existingVer.Browser,
-              target_url: check.target?.url,
+              target_url: chartTarget.url,
             };
           }
         }
@@ -380,71 +522,56 @@ export async function ensureHeadlessTradingView({ port = CDP_PORT, forceRestart 
 
       console.log(`[tv-browser] Launching ${binary} on CDP port ${port}...`);
 
-      // Try standard container multi-process headless first, then fallback to --single-process if restricted
-      let attempt = await spawnAndWaitCdp({
-        binary,
-        args: buildFlags({ profileDir, cdpPort: port, isSparticuz, singleProcess: false }),
-        cdpPort: port,
-        timeoutMs: 15000,
-      });
-      let mode = 'multi-process';
+      const profiles = getLaunchProfiles({ profileDir, cdpPort: port, isSparticuz });
+      let winner = null;
+      let winnerProfile = null;
+      const errors = [];
 
-      if (!attempt.ok) {
-        console.warn(`[tv-browser] Multi-process launch failed (${attempt.error}). Retrying with --single-process...`);
-        attempt = await spawnAndWaitCdp({
-          binary,
-          args: buildFlags({ profileDir, cdpPort: port, isSparticuz, singleProcess: true }),
-          cdpPort: port,
-          timeoutMs: 15000,
-        });
-        mode = 'single-process';
+      for (const profile of profiles) {
+        const res = await tryLaunchProfile({ binary, profile, cdpPort: port });
+        if (res.ok) {
+          winner = res;
+          winnerProfile = profile;
+          break;
+        }
+        console.warn(`[tv-browser] Profile "${profile.name}" failed: ${res.error}`);
+        errors.push(`${profile.name}: ${res.error}`);
       }
 
-      if (!attempt.ok) {
+      if (!winner) {
         browserState.status = 'error';
-        browserState.lastError = attempt.error;
-        throw new Error(`Failed to launch headless Chromium: ${attempt.error}`);
+        browserState.lastError = errors.join(' | ');
+        throw new Error(`All Chromium profiles failed: ${browserState.lastError}`);
       }
 
-      browserProcess = attempt.child;
+      browserProcess = winner.child;
       browserState.pid = browserProcess.pid;
       browserState.binary = binary;
-      browserState.mode = mode;
+      browserState.mode = winnerProfile.name;
       browserState.startedAt = new Date().toISOString();
+      browserState.status = winner.chartReady ? 'ready' : 'cdp_up_chart_loading';
 
       browserProcess.on('exit', (code, signal) => {
         console.warn(`[tv-browser] Chromium process exited (code=${code}, signal=${signal})`);
-        if (browserProcess?.pid === attempt.child.pid) {
+        if (browserProcess?.pid === winner.child.pid) {
           browserProcess = null;
           browserState.status = 'exited';
         }
       });
 
-      if (process.env.TV_SESSIONID) {
-        try {
-          console.log('[tv-browser] Injecting TV_SESSIONID cookie...');
-          await injectTradingViewCookies({ port });
-        } catch (e) {
-          console.warn('[tv-browser] Cookie injection warning:', e.message);
-        }
-      }
-
-      console.log('[tv-browser] Waiting for TradingView chart widget to finish initializing...');
-      const readyInfo = await ensureChartReady(port, 30000);
-      browserState.status = readyInfo.ready ? 'ready' : 'cdp_up_chart_loading';
-      console.log(`[tv-browser] Status: ${browserState.status} (${readyInfo.target?.url || CHART_URL})`);
+      console.log(`[tv-browser] ✅ Active profile: "${winnerProfile.name}", status: ${browserState.status} (${winner.target?.url || CHART_URL})`);
 
       return {
         success: true,
         platform: process.platform,
         binary,
-        mode,
+        mode: winnerProfile.name,
         pid: browserState.pid,
         cdp_port: port,
         cdp_url: `http://${CDP_HOST}:${port}`,
-        chart_ready: readyInfo.ready,
-        browser: attempt.version?.Browser,
-        user_agent: attempt.version?.['User-Agent'],
+        chart_ready: winner.chartReady,
+        browser: winner.version?.Browser,
+        user_agent: winner.version?.['User-Agent'],
       };
     } catch (err) {
       browserState.status = 'error';
