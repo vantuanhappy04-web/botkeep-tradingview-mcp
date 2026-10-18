@@ -217,7 +217,7 @@ async function resolveSparticuzChromium() {
   ].filter(Boolean);
   process.env.LD_LIBRARY_PATH = [...new Set(ldParts)].join(':');
 
-  // 4. Quick container diagnostics (RAM, cgroup limit, missing .so check)
+  // 4. Quick container diagnostics (RAM, cgroup limit, limits, missing .so check)
   try {
     let cgroupMem = 'unknown';
     for (const cgPath of ['/sys/fs/cgroup/memory.max', '/sys/fs/cgroup/memory/memory.limit_in_bytes']) {
@@ -226,8 +226,21 @@ async function resolveSparticuzChromium() {
         break;
       }
     }
+    let cgroupPids = 'unknown';
+    for (const pidPath of ['/sys/fs/cgroup/pids.max', '/sys/fs/cgroup/pids/pids.max']) {
+      if (existsSync(pidPath)) {
+        cgroupPids = readFileSync(pidPath, 'utf8').trim();
+        break;
+      }
+    }
+    let vmemLimit = 'unknown';
+    if (existsSync('/proc/self/limits')) {
+      const lim = readFileSync('/proc/self/limits', 'utf8');
+      const m = lim.split('\n').find((l) => l.startsWith('Max address space'));
+      if (m) vmemLimit = m.replace(/\s+/g, ' ').trim();
+    }
     console.log(
-      `[tv-browser] Host RAM free=${Math.round(freemem() / 1048576)}MB/${Math.round(totalmem() / 1048576)}MB, cgroup.mem=${cgroupMem}`
+      `[tv-browser] Host RAM free=${Math.round(freemem() / 1048576)}MB/${Math.round(totalmem() / 1048576)}MB, cgroup.mem=${cgroupMem}, pids.max=${cgroupPids}, sqlite3=${existsSync(targetSqliteSo)}, ${vmemLimit}`
     );
     const lddChr = execFileSync('ldd', [chromiumPath], { env: process.env, encoding: 'utf8' });
     const missChr = lddChr.split('\n').filter((l) => l.includes('not found'));
@@ -288,6 +301,8 @@ function getLaunchProfiles({ profileDir, cdpPort, isSparticuz }) {
     isSparticuz ? '--headless=shell' : '--headless=new',
     '--no-sandbox',
     '--disable-setuid-sandbox',
+    '--disable-seccomp-filter-sandbox',
+    '--disable-namespace-sandbox',
     '--disable-dev-shm-usage',
     '--disable-breakpad',
     '--disable-crash-reporter',
@@ -317,30 +332,23 @@ function getLaunchProfiles({ profileDir, cdpPort, isSparticuz }) {
     '--remote-debugging-address=127.0.0.1',
   ];
 
+  const disableFeatures = [
+    'AudioServiceOutOfProcess',
+    'AudioServiceSandbox',
+    'IsolateOrigins',
+    'site-per-process',
+    'WebAssemblyTrapHandler',
+    'WebAssemblyTiering',
+    'WebAssemblyDynamicTiering',
+    'WebAssemblyLazyCompilation',
+    'BackForwardCache',
+  ].join(',');
+
+  const enableFeatures = ['NetworkServiceInProcess2', 'TracingServiceInProcess'].join(',');
+
   return [
     {
-      name: 'single-process-swiftshader',
-      directUrl: true,
-      args: [
-        ...baseCommon,
-        '--no-zygote',
-        '--single-process',
-        '--in-process-gpu',
-        '--ignore-gpu-blocklist',
-        '--use-gl=angle',
-        '--use-angle=swiftshader',
-        '--enable-unsafe-swiftshader',
-        '--disable-features=AudioServiceOutOfProcess,IsolateOrigins,site-per-process',
-        '--enable-features=SharedArrayBuffer',
-        '--num-raster-threads=1',
-        '--js-flags=--max-old-space-size=384',
-        `--user-data-dir=${join(profileDir, 'p1')}`,
-        CHART_URL,
-      ],
-    },
-    {
-      name: 'single-process-2d',
-      directUrl: true,
+      name: 'single-process-2d-nowasmtrap',
       args: [
         ...baseCommon,
         '--no-zygote',
@@ -351,30 +359,49 @@ function getLaunchProfiles({ profileDir, cdpPort, isSparticuz }) {
         '--disable-3d-apis',
         '--disable-gpu-compositing',
         '--disable-accelerated-2d-canvas',
-        '--disable-features=AudioServiceOutOfProcess,IsolateOrigins,site-per-process,Vulkan',
-        '--enable-features=SharedArrayBuffer',
+        `--disable-features=${disableFeatures},Vulkan`,
+        `--enable-features=${enableFeatures}`,
         '--num-raster-threads=1',
-        '--js-flags=--max-old-space-size=384',
-        `--user-data-dir=${join(profileDir, 'p2')}`,
-        CHART_URL,
+        '--js-flags=--no-wasm-tier-up --no-wasm-dynamic-tiering --no-wasm-lazy-compilation',
+        `--user-data-dir=${join(profileDir, 'p1')}`,
+        'about:blank',
       ],
     },
     {
-      name: 'multiprocess-2d-zygote',
-      directUrl: true,
+      name: 'single-process-swiftshader-nowasmtrap',
       args: [
         ...baseCommon,
+        '--no-zygote',
+        '--single-process',
+        '--in-process-gpu',
+        '--ignore-gpu-blocklist',
+        '--use-gl=angle',
+        '--use-angle=swiftshader',
+        '--enable-unsafe-swiftshader',
+        `--disable-features=${disableFeatures}`,
+        `--enable-features=${enableFeatures}`,
+        '--num-raster-threads=1',
+        '--js-flags=--no-wasm-tier-up --no-wasm-dynamic-tiering --no-wasm-lazy-compilation',
+        `--user-data-dir=${join(profileDir, 'p2')}`,
+        'about:blank',
+      ],
+    },
+    {
+      name: 'multiprocess-inproc-net',
+      args: [
+        ...baseCommon,
+        '--in-process-gpu',
         '--disable-gpu',
         '--disable-webgl',
         '--disable-3d-apis',
         '--disable-gpu-compositing',
-        '--disable-software-rasterizer',
         '--renderer-process-limit=1',
         '--num-raster-threads=1',
-        '--disable-features=AudioServiceOutOfProcess,IsolateOrigins,site-per-process,Vulkan,UseDisplayCompositor',
-        '--js-flags=--max-old-space-size=384',
+        `--disable-features=${disableFeatures},Vulkan,UseDisplayCompositor`,
+        `--enable-features=${enableFeatures}`,
+        '--js-flags=--no-wasm-tier-up --no-wasm-dynamic-tiering --no-wasm-lazy-compilation',
         `--user-data-dir=${join(profileDir, 'p3')}`,
-        CHART_URL,
+        'about:blank',
       ],
     },
   ];
@@ -462,47 +489,76 @@ async function tryLaunchProfile({ binary, profile, cdpPort }) {
     return { ok: false, error: `CDP timeout (${stderrTail.trim().slice(-400)})` };
   }
 
-  // 2. If TV_SESSIONID is configured (or profile launched about:blank), inject cookies and navigate
-  if (process.env.TV_SESSIONID || !profile.directUrl) {
-    try {
-      const targets = await listCdpTargets(cdpPort);
-      const pageTarget = targets.find((t) => t.type === 'page');
-      if (pageTarget) {
-        const c = await CDP({ host: CDP_HOST, port: cdpPort, target: pageTarget.id });
-        try {
-          await c.Network.enable();
-          if (process.env.TV_SESSIONID) {
-            await c.Network.setCookie({
-              name: 'sessionid',
-              value: process.env.TV_SESSIONID,
-              domain: '.tradingview.com',
-              path: '/',
-              secure: true,
-              httpOnly: true,
-              sameSite: 'Lax',
-            });
-            if (process.env.TV_SESSIONID_SIGN) {
-              await c.Network.setCookie({
-                name: 'sessionid_sign',
-                value: process.env.TV_SESSIONID_SIGN,
-                domain: '.tradingview.com',
-                path: '/',
-                secure: true,
-                httpOnly: true,
-                sameSite: 'Lax',
-              });
-            }
-            browserState.loggedInCookieInjected = true;
-          }
-          await c.Page.enable();
-          await c.Page.navigate({ url: CHART_URL });
-        } finally {
-          try { await c.close(); } catch {}
+  // 2. Staged probe & navigation with live telemetry
+  let stage = '0:cdp-connected';
+  let lastReq = 'none';
+  let lastTargetEvt = 'none';
+  let cdpClient = null;
+
+  try {
+    const targets = await listCdpTargets(cdpPort);
+    const pageTarget = targets.find((t) => t.type === 'page');
+    if (pageTarget) {
+      cdpClient = await CDP({ host: CDP_HOST, port: cdpPort, target: pageTarget.id });
+      cdpClient.on('Network.requestWillBeSent', (params) => {
+        if (params?.request?.url && !params.request.url.startsWith('data:')) {
+          lastReq = `${params.type || 'req'}:${params.request.url.slice(0, 90)}`;
         }
+      });
+      cdpClient.on('Target.targetCreated', (params) => {
+        if (params?.targetInfo) {
+          lastTargetEvt = `${params.targetInfo.type}:${(params.targetInfo.url || '').slice(0, 60)}`;
+        }
+      });
+      await cdpClient.Page.enable();
+      await cdpClient.Network.enable();
+      try {
+        await cdpClient.Target.setDiscoverTargets({ discover: true });
+      } catch {}
+
+      // Stage 1: Verify HTML + Font rendering locally via data: URL
+      stage = '1:data-html';
+      await cdpClient.Page.navigate({ url: 'data:text/html,<html><body><h1>TV Ready Check</h1></body></html>' });
+      await new Promise((r) => setTimeout(r, 250));
+      if (exitInfo) throw new Error('Crashed at 1:data-html');
+
+      // Stage 2: Verify HTTPS + NSS via tiny robots.txt on tradingview.com
+      stage = '2:https-robots';
+      await cdpClient.Page.navigate({ url: 'https://www.tradingview.com/robots.txt' });
+      await new Promise((r) => setTimeout(r, 600));
+      if (exitInfo) throw new Error('Crashed at 2:https-robots');
+
+      if (process.env.TV_SESSIONID) {
+        await cdpClient.Network.setCookie({
+          name: 'sessionid',
+          value: process.env.TV_SESSIONID,
+          domain: '.tradingview.com',
+          path: '/',
+          secure: true,
+          httpOnly: true,
+          sameSite: 'Lax',
+        });
+        if (process.env.TV_SESSIONID_SIGN) {
+          await cdpClient.Network.setCookie({
+            name: 'sessionid_sign',
+            value: process.env.TV_SESSIONID_SIGN,
+            domain: '.tradingview.com',
+            path: '/',
+            secure: true,
+            httpOnly: true,
+            sameSite: 'Lax',
+          });
+        }
+        browserState.loggedInCookieInjected = true;
       }
-    } catch (e) {
-      console.warn(`[tv-browser] Pre-navigation warning (${profile.name}):`, e.message);
+
+      // Stage 3: Navigate to full TradingView chart
+      stage = '3:chart-nav';
+      console.log(`[tv-browser] [${profile.name}] Probes 1(html) & 2(https) passed! Opening chart...`);
+      await cdpClient.Page.navigate({ url: CHART_URL });
     }
+  } catch (e) {
+    console.warn(`[tv-browser] Stage warning (${profile.name} @ ${stage}, lastReq=${lastReq}, lastTarget=${lastTargetEvt}):`, e.message);
   }
 
   // 3. Wait up to 25s for window.TradingViewApi._activeChartWidgetWV.value() AND verify child hasn't crashed!
@@ -510,28 +566,23 @@ async function tryLaunchProfile({ binary, profile, cdpPort }) {
   let lastTarget = null;
   while (Date.now() < chartDeadline) {
     if (exitInfo) {
+      try { if (cdpClient) await cdpClient.close(); } catch {}
       return {
         ok: false,
-        error: `Crashed while loading TradingView (${JSON.stringify(exitInfo)}): ${stderrTail.trim().slice(-500)}`,
+        error: `Crashed at [${stage}] (lastReq=${lastReq}, lastTarget=${lastTargetEvt}, exit=${JSON.stringify(exitInfo)}): ${stderrTail.trim().slice(-300)}`,
       };
     }
 
-    const targets = await listCdpTargets(cdpPort);
-    const chartTarget =
-      targets.find((t) => t.type === 'page' && /tradingview\.com\/chart/i.test(t.url)) ||
-      targets.find((t) => t.type === 'page' && /tradingview/i.test(t.url));
-
-    if (chartTarget) {
-      lastTarget = chartTarget;
-      let c = null;
-      try {
-        c = await CDP({ host: CDP_HOST, port: cdpPort, target: chartTarget.id });
-        const { result } = await c.Runtime.evaluate({
+    try {
+      if (cdpClient) {
+        const { result } = await cdpClient.Runtime.evaluate({
           expression: `Boolean(window.TradingViewApi && window.TradingViewApi._activeChartWidgetWV && window.TradingViewApi._activeChartWidgetWV.value())`,
           returnByValue: true,
         });
-        await c.close();
         if (result?.value === true) {
+          try { await cdpClient.close(); } catch {}
+          const targets = await listCdpTargets(cdpPort);
+          const chartTarget = targets.find((t) => t.type === 'page' && /tradingview/i.test(t.url)) || targets.find((t) => t.type === 'page');
           return {
             ok: true,
             child,
@@ -540,15 +591,17 @@ async function tryLaunchProfile({ binary, profile, cdpPort }) {
             chartReady: true,
           };
         }
-      } catch {
-        try { if (c) await c.close(); } catch {}
       }
-    }
+    } catch {}
+
     await new Promise((r) => setTimeout(r, 1000));
   }
 
+  try { if (cdpClient) await cdpClient.close(); } catch {}
+
   if (!exitInfo) {
-    // Alive after 25s even if widget still finishing
+    const targets = await listCdpTargets(cdpPort);
+    lastTarget = targets.find((t) => t.type === 'page');
     return {
       ok: true,
       child,
@@ -561,7 +614,7 @@ async function tryLaunchProfile({ binary, profile, cdpPort }) {
   try { child.kill('SIGKILL'); } catch {}
   return {
     ok: false,
-    error: `Failed chart init (${JSON.stringify(exitInfo)}): ${stderrTail.trim().slice(-500)}`,
+    error: `Failed chart init at [${stage}] (lastReq=${lastReq}, exit=${JSON.stringify(exitInfo)}): ${stderrTail.trim().slice(-300)}`,
   };
 }
 
