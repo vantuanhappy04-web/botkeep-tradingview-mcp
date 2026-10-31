@@ -417,7 +417,10 @@ const httpServer = http.createServer(async (req, res) => {
         process.env.TV_AUTO_LAUNCH === 'false'
       ) {
         try {
-          tvHealth = await healthCheck();
+          tvHealth = await Promise.race([
+            healthCheck(),
+            new Promise((_, rej) => setTimeout(() => rej(new Error('CDP health check timed out (2.5s)')), 2500)),
+          ]);
         } catch (e) {
           tvHealth = { cdp_connected: false, error: e.message };
         }

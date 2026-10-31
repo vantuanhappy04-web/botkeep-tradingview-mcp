@@ -36,6 +36,13 @@ EOF
   as_root chown user:user "$ENV_FILE"
 fi
 
+# Ensure metatrader_mcp & metatrader_client are installed in Wine Python site-packages
+if [ -d "$WINE_DIR/drive_c/Python311/Lib/site-packages" ] && [ -d "$APP_DIR/mt5-mcp/src" ]; then
+  cp -rf "$APP_DIR/mt5-mcp/src/metatrader_mcp" "$WINE_DIR/drive_c/Python311/Lib/site-packages/"
+  cp -rf "$APP_DIR/mt5-mcp/src/metatrader_client" "$WINE_DIR/drive_c/Python311/Lib/site-packages/"
+  as_root chown -R user:user "$WINE_DIR/drive_c/Python311/Lib/site-packages"
+fi
+
 # 1. Start InstaBox official Xfce + Xvnc desktop on DISPLAY=:1 (127.0.0.1:5901)
 if [ "$(id -u)" -eq 0 ]; then
   su - user -c 'printf "start\n1440x900\n\n" | /usr/local/bin/instabox-desktop >/dev/null 2>&1 || true'
@@ -71,9 +78,11 @@ Type=simple
 User=user
 Environment=DISPLAY=:1
 Environment=XDG_RUNTIME_DIR=/run/user/1000
+Environment=DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus
 Environment=GDK_BACKEND=x11
 Environment=XDG_SESSION_TYPE=x11
-ExecStart=/usr/bin/tradingview --user-data-dir=/data/trading/tv-profile --remote-debugging-port=9222 --remote-allow-origins=* --no-sandbox --disable-dev-shm-usage
+ExecStart=/usr/bin/tradingview --user-data-dir=/data/trading/tv-profile --remote-debugging-port=9222 --remote-allow-origins=* --no-sandbox --disable-gpu --disable-dev-shm-usage
+TimeoutStopSec=5
 Restart=always
 RestartSec=5
 
@@ -95,6 +104,7 @@ Environment=WINEARCH=win64
 Environment=WINEDEBUG=-all
 WorkingDirectory=/data/trading/wine-mt5/drive_c/Program Files/MetaTrader 5
 ExecStart=/usr/bin/wine "C:\\Program Files\\MetaTrader 5\\terminal64.exe" /portable
+TimeoutStopSec=5
 Restart=always
 RestartSec=6
 
