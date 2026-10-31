@@ -73,7 +73,7 @@ function probeTcpPort(host, port, timeoutMs = 1200) {
 }
 
 function proxyHttpRequest(req, res, targetHost, targetPort, targetPath) {
-  const fwdHeaders = { ...req.headers, host: `${targetHost}:${targetPort}` };
+  const fwdHeaders = { ...req.headers, host: `${targetHost}:${targetPort}`, connection: 'close' };
   delete fwdHeaders['authorization'];
   delete fwdHeaders['x-api-key'];
   const proxyReq = http.request(
@@ -83,9 +83,12 @@ function proxyHttpRequest(req, res, targetHost, targetPort, targetPath) {
       path: targetPath,
       method: req.method,
       headers: fwdHeaders,
+      agent: false,
     },
     (proxyRes) => {
       const outHeaders = { ...proxyRes.headers };
+      delete outHeaders['connection'];
+      delete outHeaders['keep-alive'];
       outHeaders['access-control-allow-origin'] = '*';
       outHeaders['access-control-expose-headers'] = 'mcp-session-id';
       res.writeHead(proxyRes.statusCode || 502, outHeaders);
@@ -124,7 +127,11 @@ function proxyMt5NativeMcp(req, res, targetPath, nativeKey) {
       } catch {}
     }
 
-    const fwdHeaders = { ...req.headers, host: `${MT5_NATIVE_MCP_HOST}:${MT5_NATIVE_MCP_PORT}` };
+    const fwdHeaders = {
+      ...req.headers,
+      host: `${MT5_NATIVE_MCP_HOST}:${MT5_NATIVE_MCP_PORT}`,
+      connection: 'close',
+    };
     delete fwdHeaders['x-api-key'];
     delete fwdHeaders['cookie'];
     if (nativeKey) {
@@ -143,9 +150,12 @@ function proxyMt5NativeMcp(req, res, targetPath, nativeKey) {
         path: targetPath,
         method: req.method,
         headers: fwdHeaders,
+        agent: false,
       },
       (proxyRes) => {
         const outHeaders = { ...proxyRes.headers };
+        delete outHeaders['connection'];
+        delete outHeaders['keep-alive'];
         outHeaders['access-control-allow-origin'] = '*';
         outHeaders['access-control-expose-headers'] = 'mcp-session-id';
 
