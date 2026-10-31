@@ -43,6 +43,7 @@ def build_client_from_env(
     server = server if server is not None else os.getenv("server") or os.getenv("MT5_SERVER")
     path = path if path is not None else os.getenv("MT5_PATH")
     portable_raw = (os.getenv("MT5_PORTABLE") or "").strip().lower()
+    timeout_raw = (os.getenv("MT5_TIMEOUT_MS") or "").strip()
 
     if login and password and server:
         config["login"] = int(login)
@@ -52,6 +53,8 @@ def build_client_from_env(
         config["path"] = path
     if portable_raw in ("1", "true", "yes"):
         config["portable"] = True
+    if timeout_raw.isdigit():
+        config["timeout"] = int(timeout_raw)
 
     return client.MT5Client(config=config)
 
@@ -69,6 +72,9 @@ def init(
     instance alive and reconnect automatically on the first tool invocation.
     """
     mt5_client = build_client_from_env(login=login, password=password, server=server, path=path)
+    lazy_only = (os.getenv("MT5_LAZY_INIT") or "").strip().lower() in ("1", "true", "yes")
+    if allow_lazy and lazy_only:
+        return mt5_client
     try:
         mt5_client.connect()
     except Exception as exc:

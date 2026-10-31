@@ -1,4 +1,5 @@
 import './env-loader.js';
+import fs from 'node:fs';
 import http from 'node:http';
 import net from 'node:net';
 import { randomUUID } from 'node:crypto';
@@ -27,7 +28,21 @@ const HOST = process.env.HOST || '0.0.0.0';
 const API_KEY = process.env.MCP_API_KEY || '';
 const MT5_MCP_HOST = process.env.MT5_MCP_HOST || '127.0.0.1';
 const MT5_MCP_PORT = Number(process.env.MT5_MCP_PORT || 8080);
+const MT5_NATIVE_MCP_HOST = process.env.MT5_NATIVE_MCP_HOST || '127.0.0.1';
+const MT5_NATIVE_MCP_PORT = Number(process.env.MT5_NATIVE_MCP_PORT || 22346);
+const MT5_NATIVE_KEY_FILE = process.env.MT5_NATIVE_KEY_FILE || '/data/trading/.mt5_native_mcp_key';
 const NOVNC_PORT = Number(process.env.NOVNC_PORT || 6080);
+
+function getMt5NativeMcpKey() {
+  const envKey = (process.env.MT5_NATIVE_MCP_KEY || '').trim();
+  if (envKey) return envKey;
+  try {
+    if (fs.existsSync(MT5_NATIVE_KEY_FILE)) {
+      return fs.readFileSync(MT5_NATIVE_KEY_FILE, 'utf8').trim();
+    }
+  } catch {}
+  return '';
+}
 
 function parseCookies(cookieHeader = '') {
   const out = {};
@@ -86,6 +101,94 @@ function proxyHttpRequest(req, res, targetHost, targetPort, targetPath) {
     }
   });
   req.pipe(proxyReq);
+}
+
+function proxyMt5NativeMcp(req, res, targetPath, nativeKey) {
+  const reqChunks = [];
+  req.on('data', (chunk) => reqChunks.push(chunk));
+  req.on('error', (err) => {
+    if (!res.headersSent) {
+      res.writeHead(400, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: err.message }));
+    }
+  });
+  req.on('end', () => {
+    const reqBuf = Buffer.concat(reqChunks);
+    let requestedProtocol = '';
+    if (req.method === 'POST' && reqBuf.length > 0 && reqBuf.length < 65536) {
+      try {
+        const parsed = JSON.parse(reqBuf.toString('utf8'));
+        if (parsed && parsed.method === 'initialize' && parsed.params?.protocolVersion) {
+          requestedProtocol = String(parsed.params.protocolVersion);
+        }
+      } catch {}
+    }
+
+    const fwdHeaders = { ...req.headers, host: `${MT5_NATIVE_MCP_HOST}:${MT5_NATIVE_MCP_PORT}` };
+    delete fwdHeaders['x-api-key'];
+    delete fwdHeaders['cookie'];
+    if (nativeKey) {
+      fwdHeaders['authorization'] = `Bearer ${nativeKey}`;
+    } else {
+      delete fwdHeaders['authorization'];
+    }
+    if (reqBuf.length > 0) {
+      fwdHeaders['content-length'] = String(reqBuf.length);
+    }
+
+    const proxyReq = http.request(
+      {
+        hostname: MT5_NATIVE_MCP_HOST,
+        port: MT5_NATIVE_MCP_PORT,
+        path: targetPath,
+        method: req.method,
+        headers: fwdHeaders,
+      },
+      (proxyRes) => {
+        const outHeaders = { ...proxyRes.headers };
+        outHeaders['access-control-allow-origin'] = '*';
+        outHeaders['access-control-expose-headers'] = 'mcp-session-id';
+
+        if (!requestedProtocol) {
+          res.writeHead(proxyRes.statusCode || 502, outHeaders);
+          proxyRes.pipe(res);
+          return;
+        }
+
+        const resChunks = [];
+        proxyRes.on('data', (c) => resChunks.push(c));
+        proxyRes.on('end', () => {
+          let outBuf = Buffer.concat(resChunks);
+          try {
+            const respObj = JSON.parse(outBuf.toString('utf8'));
+            if (respObj?.result?.protocolVersion && respObj.result.protocolVersion !== requestedProtocol) {
+              respObj.result.protocolVersion = requestedProtocol;
+              outBuf = Buffer.from(JSON.stringify(respObj), 'utf8');
+              outHeaders['content-length'] = String(outBuf.length);
+            }
+          } catch {}
+          res.writeHead(proxyRes.statusCode || 502, outHeaders);
+          res.end(outBuf);
+        });
+      }
+    );
+
+    proxyReq.on('error', (err) => {
+      if (!res.headersSent) {
+        res.writeHead(502, { 'Content-Type': 'application/json' });
+        res.end(
+          JSON.stringify({
+            error: `MetaTrader 5 Native MCP (${MT5_NATIVE_MCP_HOST}:${MT5_NATIVE_MCP_PORT}) unavailable: ${err.message}`,
+          })
+        );
+      } else {
+        res.end();
+      }
+    });
+
+    if (reqBuf.length > 0) proxyReq.write(reqBuf);
+    proxyReq.end();
+  });
 }
 
 // Active stateful Streamable HTTP sessions: sessionId -> { transport, server, createdAt }
@@ -425,8 +528,12 @@ const httpServer = http.createServer(async (req, res) => {
           tvHealth = { cdp_connected: false, error: e.message };
         }
       }
-      const mt5Up = await probeTcpPort(MT5_MCP_HOST, MT5_MCP_PORT);
-      const novncUp = await probeTcpPort('127.0.0.1', NOVNC_PORT);
+      const [mt5NativeUp, mt5PyUp, novncUp] = await Promise.all([
+        probeTcpPort(MT5_NATIVE_MCP_HOST, MT5_NATIVE_MCP_PORT),
+        probeTcpPort(MT5_MCP_HOST, MT5_MCP_PORT),
+        probeTcpPort('127.0.0.1', NOVNC_PORT),
+      ]);
+      const mt5NativeKeyReady = Boolean(getMt5NativeMcpKey());
 
       const proto = req.headers['x-forwarded-proto'] || 'http';
       const host = req.headers['host'] || `localhost:${PORT}`;
@@ -437,8 +544,12 @@ const httpServer = http.createServer(async (req, res) => {
         JSON.stringify(
           {
             service: 'trading-mcp-gateway',
-            version: '2.1.0',
-            tools_count: { tradingview: 84, metatrader: 26 },
+            version: '2.2.0',
+            tools_count: {
+              tradingview: 84,
+              metatrader_native: 107,
+              metatrader_python: 26,
+            },
             status: 'ok',
             auth_enabled: Boolean(API_KEY),
             auto_update_enabled: process.env.TV_AUTO_UPDATE !== 'false',
@@ -446,7 +557,7 @@ const httpServer = http.createServer(async (req, res) => {
               tradingview_mcp: `${baseUrl}/mcp`,
               tradingview_sse: `${baseUrl}/sse`,
               metatrader_mcp: `${baseUrl}/mt5/mcp`,
-              metatrader_sse: `${baseUrl}/mt5/sse`,
+              metatrader_python_mcp: `${baseUrl}/mt5-py/mcp`,
               remote_desktop_vnc: `${baseUrl}/desktop/vnc.html?autoconnect=true&resize=scale`,
               live_chart_viewer: `${baseUrl}/view`,
               live_screenshot: `${baseUrl}/screenshot`,
@@ -462,8 +573,12 @@ const httpServer = http.createServer(async (req, res) => {
             browser: bState,
             tradingview: tvHealth,
             metatrader: {
-              mcp_listening: mt5Up,
-              upstream: `http://${MT5_MCP_HOST}:${MT5_MCP_PORT}/mcp`,
+              mcp_listening: mt5NativeUp || mt5PyUp,
+              native_mcp_listening: mt5NativeUp,
+              native_key_configured: mt5NativeKeyReady,
+              native_upstream: `http://${MT5_NATIVE_MCP_HOST}:${MT5_NATIVE_MCP_PORT}/mcp`,
+              python_mcp_listening: mt5PyUp,
+              python_upstream: `http://${MT5_MCP_HOST}:${MT5_MCP_PORT}/mcp`,
             },
             desktop_vnc: {
               novnc_listening: novncUp,
@@ -488,9 +603,29 @@ const httpServer = http.createServer(async (req, res) => {
       res.setHeader('Set-Cookie', `mcp_auth=${encodeURIComponent(API_KEY)}; Path=/; HttpOnly; SameSite=Lax`);
     }
 
-    // MetaTrader 5 MCP reverse proxy (/mt5, /mt5/mcp, /mt5/sse, /mt5/messages)
+    // MetaTrader 5 Native C++ MCP reverse proxy (/mt5, /mt5/mcp -> 127.0.0.1:22346/mcp, 107 tools)
+    // Falls back to Python mt5-mcp (127.0.0.1:8080) for /mt5/sse, /mt5/messages, or if native key is absent.
     if (pathname === '/mt5' || pathname.startsWith('/mt5/')) {
       let subPath = pathname.slice('/mt5'.length) || '/mcp';
+      if (subPath === '/') subPath = '/mcp';
+      const fwdParams = new URLSearchParams(urlObj.searchParams);
+      fwdParams.delete('apiKey');
+      fwdParams.delete('token');
+      const qs = fwdParams.toString();
+      const targetPath = qs ? `${subPath}?${qs}` : subPath;
+      const nativeKey = getMt5NativeMcpKey();
+      const isSseSubpath = subPath === '/sse' || subPath.startsWith('/messages');
+      if (!isSseSubpath && nativeKey && (await probeTcpPort(MT5_NATIVE_MCP_HOST, MT5_NATIVE_MCP_PORT, 400))) {
+        proxyMt5NativeMcp(req, res, targetPath, nativeKey);
+        return;
+      }
+      proxyHttpRequest(req, res, MT5_MCP_HOST, MT5_MCP_PORT, targetPath);
+      return;
+    }
+
+    // MetaTrader 5 Python MCP explicit route (/mt5-py, /mt5-py/mcp -> 127.0.0.1:8080/mcp, 26 tools)
+    if (pathname === '/mt5-py' || pathname.startsWith('/mt5-py/')) {
+      let subPath = pathname.slice('/mt5-py'.length) || '/mcp';
       if (subPath === '/') subPath = '/mcp';
       const fwdParams = new URLSearchParams(urlObj.searchParams);
       fwdParams.delete('apiKey');

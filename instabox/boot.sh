@@ -28,12 +28,72 @@ TV_AUTO_LAUNCH=false
 TV_AUTO_UPDATE=false
 MT5_MCP_HOST=127.0.0.1
 MT5_MCP_PORT=8080
+MT5_NATIVE_MCP_PORT=22346
 NOVNC_PORT=6080
-MT5_PATH=C:\Program Files\MetaTrader 5\terminal64.exe
 MT5_PORTABLE=1
+MT5_LAZY_INIT=1
+MT5_TIMEOUT_MS=5000
 EOF
   chmod 600 "$ENV_FILE"
   as_root chown user:user "$ENV_FILE"
+fi
+
+grep -q '^MT5_LAZY_INIT=' "$ENV_FILE" 2>/dev/null || echo 'MT5_LAZY_INIT=1' >> "$ENV_FILE"
+grep -q '^MT5_TIMEOUT_MS=' "$ENV_FILE" 2>/dev/null || echo 'MT5_TIMEOUT_MS=5000' >> "$ENV_FILE"
+
+# Ensure Config -> config symlink on case-sensitive Linux ext4 so terminal.lic is visible in /portable mode
+MT5_DIR="$WINE_DIR/drive_c/Program Files/MetaTrader 5"
+MT5_EXEC_ARGS="/portable"
+if [ -d "$MT5_DIR" ]; then
+  mkdir -p "$MT5_DIR/config"
+  if [ -d "$MT5_DIR/Config" ] && [ ! -L "$MT5_DIR/Config" ]; then
+    cp -af "$MT5_DIR/Config/." "$MT5_DIR/config/"
+    rm -rf "$MT5_DIR/Config"
+    ln -s config "$MT5_DIR/Config"
+  fi
+  if [ -f "$TRADING_ROOT/servers.dat" ]; then
+    CUR_SZ=$(stat -c%s "$MT5_DIR/config/servers.dat" 2>/dev/null || echo 0)
+    BAK_SZ=$(stat -c%s "$TRADING_ROOT/servers.dat" 2>/dev/null || echo 0)
+    if [ "$BAK_SZ" -gt "$CUR_SZ" ]; then
+      cp -f "$TRADING_ROOT/servers.dat" "$MT5_DIR/config/servers.dat"
+    fi
+  fi
+  python3 - "$ENV_FILE" "$MT5_DIR/config/startup.ini" <<'PYEOF'
+import os, sys
+env_path, startup_path = sys.argv[1], sys.argv[2]
+env = {}
+if os.path.exists(env_path):
+    with open(env_path, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if line and not line.startswith("#") and "=" in line:
+                k, v = line.split("=", 1)
+                env[k.strip()] = v.strip()
+if env.get("MT5_LOGIN") and env.get("MT5_PASSWORD") and env.get("MT5_SERVER"):
+    ini = (
+        "[Common]\r\n"
+        f"Login={env['MT5_LOGIN']}\r\n"
+        f"Password={env['MT5_PASSWORD']}\r\n"
+        f"Server={env['MT5_SERVER']}\r\n"
+        "KeepPrivate=1\r\n"
+        "CertInstall=0\r\n"
+        "NewsEnable=0\r\n"
+        "[Experts]\r\n"
+        "AllowDllImport=0\r\n"
+        "Enabled=1\r\n"
+        "Account=1\r\n"
+        "Profile=1\r\n"
+        "Chart=0\r\n"
+        "Api=0\r\n"
+    )
+    with open(startup_path, "wb") as f:
+        f.write(b"\xff\xfe" + ini.encode("utf-16-le"))
+    os.chmod(startup_path, 0o600)
+PYEOF
+  if [ -f "$MT5_DIR/config/startup.ini" ]; then
+    MT5_EXEC_ARGS="/portable /config:config\\\\startup.ini"
+  fi
+  as_root chown -R user:user "$MT5_DIR"
 fi
 
 # Ensure metatrader_mcp & metatrader_client are installed in Wine Python site-packages
@@ -76,12 +136,14 @@ After=network.target trading-novnc.service
 [Service]
 Type=simple
 User=user
+Environment=HOME=/data/home
 Environment=DISPLAY=:1
 Environment=XDG_RUNTIME_DIR=/run/user/1000
 Environment=DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus
 Environment=GDK_BACKEND=x11
 Environment=XDG_SESSION_TYPE=x11
-ExecStart=/usr/bin/tradingview --user-data-dir=/data/trading/tv-profile --remote-debugging-port=9222 --remote-allow-origins=* --no-sandbox --disable-gpu --disable-dev-shm-usage
+UnsetEnvironment=NODE_OPTIONS
+ExecStart=/usr/bin/env -u NODE_OPTIONS /opt/TradingView/tradingview --password-store=basic --remote-debugging-port=9222 --remote-allow-origins=* --no-sandbox --disable-gpu --disable-dev-shm-usage https://www.tradingview.com/chart/
 TimeoutStopSec=5
 Restart=always
 RestartSec=5
@@ -90,7 +152,7 @@ RestartSec=5
 WantedBy=multi-user.target
 EOF
 
-as_root tee /etc/systemd/system/mt5-terminal.service >/dev/null <<'EOF'
+as_root tee /etc/systemd/system/mt5-terminal.service >/dev/null <<EOF
 [Unit]
 Description=MetaTrader 5 Terminal (Wine64 Portable on DISPLAY=:1)
 After=network.target trading-novnc.service
@@ -98,12 +160,13 @@ After=network.target trading-novnc.service
 [Service]
 Type=simple
 User=user
+Environment=HOME=/data/home
 Environment=DISPLAY=:1
 Environment=WINEPREFIX=/data/trading/wine-mt5
-Environment=WINEARCH=win64
 Environment=WINEDEBUG=-all
+Environment=WINEDLLOVERRIDES=mscoree,mshtml=
 WorkingDirectory=/data/trading/wine-mt5/drive_c/Program Files/MetaTrader 5
-ExecStart=/usr/bin/wine "C:\\Program Files\\MetaTrader 5\\terminal64.exe" /portable
+ExecStart=/usr/bin/wine "C:\\\\Program Files\\\\MetaTrader 5\\\\terminal64.exe" $MT5_EXEC_ARGS
 TimeoutStopSec=5
 Restart=always
 RestartSec=6
@@ -120,11 +183,11 @@ After=network.target mt5-terminal.service
 [Service]
 Type=simple
 User=user
+Environment=HOME=/data/home
 Environment=DISPLAY=:1
 Environment=WINEPREFIX=/data/trading/wine-mt5
-Environment=WINEARCH=win64
 Environment=WINEDEBUG=-all
-Environment=PYTHONPATH=Z:\data\trading\app\mt5-mcp\src
+Environment=WINEDLLOVERRIDES=mscoree,mshtml=
 EnvironmentFile=-/data/trading/.env
 WorkingDirectory=/data/trading/app/mt5-mcp
 ExecStart=/usr/bin/wine "C:\\Python311\\python.exe" -m metatrader_mcp.cli --transport streamable-http --host 127.0.0.1 --port 8080
@@ -156,5 +219,13 @@ EOF
 as_root systemctl daemon-reload
 as_root systemctl enable trading-novnc tradingview-desktop mt5-terminal mt5-mcp trading-gateway >/dev/null 2>&1 || true
 as_root systemctl start trading-novnc tradingview-desktop mt5-terminal mt5-mcp trading-gateway
+
+if [ ! -s "$TRADING_ROOT/.mt5_native_mcp_key" ] && [ -f "$APP_DIR/instabox/extract_mt5_mcp_key.sh" ]; then
+  if [ "$(id -u)" -eq 0 ]; then
+    su - user -c "nohup bash '$APP_DIR/instabox/extract_mt5_mcp_key.sh' >/dev/null 2>&1 &" || true
+  else
+    nohup bash "$APP_DIR/instabox/extract_mt5_mcp_key.sh" >/dev/null 2>&1 &
+  fi
+fi
 
 echo "All 5 Trading services are enabled and started."
