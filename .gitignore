@@ -7,3 +7,9 @@ tmp-*
 *.log
 discovery-log.json
 rules.json
+.env
+.env.*
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/

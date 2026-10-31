@@ -6,9 +6,56 @@ let targetInfo = null;
 // Default is 127.0.0.1, not localhost: on some Windows machines localhost
 // resolves to ::1 first, and Electron's --remote-debugging-port only listens on IPv4.
 export const CDP_HOST = process.env.TV_CDP_HOST || process.env.CDP_HOST || '127.0.0.1';
-export const CDP_PORT = Number(process.env.TV_CDP_PORT || process.env.CDP_PORT) || 9222;
+export const CDP_PORT = Number(process.env.TV_CDP_PORT || process.env.CDP_PORT) || 9223;
+let activeCdpPort = CDP_PORT;
+const CANDIDATE_PORTS = [...new Set([CDP_PORT, 9223, 9222, 9224])];
 const MAX_RETRIES = 5;
 const BASE_DELAY = 500;
+
+export function getActiveCdpPort() {
+  return activeCdpPort;
+}
+
+export function setActiveCdpPort(port) {
+  if (Number.isFinite(Number(port)) && Number(port) > 0) {
+    activeCdpPort = Number(port);
+  }
+}
+
+async function fetchTargetsFromPort(port) {
+  const resp = await fetch(`http://${CDP_HOST}:${port}/json/list`, {
+    signal: AbortSignal.timeout(2000),
+  });
+  const text = await resp.text();
+  let targets;
+  try {
+    targets = JSON.parse(text);
+  } catch {
+    throw new Error(`Port ${port} is occupied by a non-CDP service`);
+  }
+  if (!Array.isArray(targets)) {
+    throw new Error(`Port ${port} did not return a CDP target list`);
+  }
+  return targets;
+}
+
+async function resolveTargetsAcrossPorts() {
+  const portsToTry = [...new Set([activeCdpPort, ...CANDIDATE_PORTS])];
+  let lastErr = null;
+  for (const port of portsToTry) {
+    try {
+      const targets = await fetchTargetsFromPort(port);
+      const hasTv = targets.some(t => t.type === 'page' && /tradingview/i.test(t.url || ''));
+      if (hasTv || targets.some(t => t.type === 'page')) {
+        activeCdpPort = port;
+        return { port, targets };
+      }
+    } catch (e) {
+      lastErr = e;
+    }
+  }
+  throw lastErr || new Error('No CDP server responding on ports ' + portsToTry.join(', '));
+}
 
 // Known direct API paths discovered via live probing (see PROBE_RESULTS.md)
 const KNOWN_PATHS = {
@@ -75,12 +122,52 @@ export async function connect(targetId = null) {
           : 'No TradingView chart target found. Is TradingView open with a chart?');
       }
       targetInfo = target;
-      client = await CDP({ host: CDP_HOST, port: CDP_PORT, target: target.id });
+      client = await CDP({ host: CDP_HOST, port: activeCdpPort, target: target.id });
 
       // Enable required domains
       await client.Runtime.enable();
       await client.Page.enable();
       await client.DOM.enable();
+      try {
+        const adblockScript = `(() => {
+          const cleanGopro = () => {
+            document.querySelectorAll('[data-dialog-name="gopro"]').forEach(el => {
+              const parentWrap = el.closest('#overlap-manager-root > div');
+              if (parentWrap) parentWrap.remove();
+              else el.remove();
+            });
+          };
+          const injectStyle = () => {
+            if (document.getElementById('__tv_adblock_style')) return;
+            const style = document.createElement('style');
+            style.id = '__tv_adblock_style';
+            style.textContent = \`
+              #overlap-manager-root > div:has([data-dialog-name="gopro"]),
+              [data-dialog-name="gopro"],
+              div[data-dialog-name="gopro"] {
+                display: none !important;
+                opacity: 0 !important;
+                pointer-events: none !important;
+                visibility: hidden !important;
+                z-index: -9999 !important;
+              }
+            \`;
+            (document.head || document.documentElement).appendChild(style);
+          };
+          if (document.readyState === 'loading') {
+            document.addEventListener('DOMContentLoaded', () => { injectStyle(); cleanGopro(); });
+          } else {
+            injectStyle();
+            cleanGopro();
+          }
+          if (!window.__tv_gopro_observer) {
+            window.__tv_gopro_observer = new MutationObserver(cleanGopro);
+            window.__tv_gopro_observer.observe(document.documentElement, { childList: true, subtree: true });
+          }
+        })()`;
+        await client.Page.addScriptToEvaluateOnNewDocument({ source: adblockScript });
+        await client.Runtime.evaluate({ expression: adblockScript, returnByValue: true });
+      } catch {}
 
       return client;
     } catch (err) {
@@ -108,8 +195,7 @@ export async function reconnectTo(targetId) {
 }
 
 async function findChartTarget() {
-  const resp = await fetch(`http://${CDP_HOST}:${CDP_PORT}/json/list`);
-  const targets = await resp.json();
+  const { targets } = await resolveTargetsAcrossPorts();
   // Prefer targets with tradingview.com/chart in the URL
   return targets.find(t => t.type === 'page' && /tradingview\.com\/chart/i.test(t.url))
     || targets.find(t => t.type === 'page' && /tradingview/i.test(t.url))
@@ -117,8 +203,7 @@ async function findChartTarget() {
 }
 
 async function findTargetById(id) {
-  const resp = await fetch(`http://${CDP_HOST}:${CDP_PORT}/json/list`);
-  const targets = await resp.json();
+  const { targets } = await resolveTargetsAcrossPorts();
   return targets.find(t => t.id === id) || null;
 }
 

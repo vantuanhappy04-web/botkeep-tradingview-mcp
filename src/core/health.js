@@ -1,8 +1,8 @@
 /**
  * Core health/discovery/launch logic.
  */
-import { getClient, getTargetInfo, evaluate, CDP_HOST, CDP_PORT } from '../connection.js';
-import { existsSync, cpSync, rmSync, readdirSync } from 'fs';
+import { getClient, getTargetInfo, evaluate, CDP_HOST, CDP_PORT, setActiveCdpPort } from '../connection.js';
+import { existsSync, cpSync, rmSync, readdirSync, statSync } from 'fs';
 import { execSync, spawn } from 'child_process';
 import { dirname, basename, join } from 'path';
 
@@ -220,10 +220,41 @@ async function _probeCdp(cdpPort) {
     const req = http.get(`http://${CDP_HOST}:${cdpPort}/json/version`, (res) => {
       let data = '';
       res.on('data', (chunk) => data += chunk);
-      res.on('end', () => resolve(data));
+      res.on('end', () => {
+        try {
+          const parsed = JSON.parse(data);
+          if (parsed && (parsed.Browser || parsed.webSocketDebuggerUrl)) {
+            resolve(data);
+            return;
+          }
+        } catch {}
+        resolve(null);
+      });
     });
     req.on('error', () => resolve(null));
     req.setTimeout(2000, () => { req.destroy(); resolve(null); });
+  });
+}
+
+async function _isPortOccupiedByNonCdp(cdpPort) {
+  const http = await import('http');
+  return new Promise((resolve) => {
+    const req = http.get(`http://${CDP_HOST}:${cdpPort}/json/version`, (res) => {
+      let data = '';
+      res.on('data', (chunk) => data += chunk);
+      res.on('end', () => {
+        try {
+          const parsed = JSON.parse(data);
+          if (parsed && (parsed.Browser || parsed.webSocketDebuggerUrl)) {
+            resolve(false);
+            return;
+          }
+        } catch {}
+        resolve(true);
+      });
+    });
+    req.on('error', () => resolve(false));
+    req.setTimeout(1500, () => { req.destroy(); resolve(false); });
   });
 }
 
@@ -283,11 +314,30 @@ function _copyMsixPackageLocal(tvPath, { cpSync, rmSync, readdirSync, existsSync
   return dstExe;
 }
 
+function _isValidExecutable(p, existsSyncFn) {
+  if (!p || !existsSyncFn(p)) return false;
+  try {
+    return statSync(p).size > 1024;
+  } catch {
+    return true;
+  }
+}
+
 export async function launch({ port, kill_existing, _deps } = {}) {
   const deps = _resolveLaunchDeps(_deps);
-  const cdpPort = port || CDP_PORT;
+  let cdpPort = port || CDP_PORT;
   const killFirst = kill_existing !== false;
   const platform = process.platform;
+
+  if (!_deps && await _isPortOccupiedByNonCdp(cdpPort)) {
+    for (const fallbackPort of [9223, 9224, 9225]) {
+      if (!(await _isPortOccupiedByNonCdp(fallbackPort))) {
+        cdpPort = fallbackPort;
+        break;
+      }
+    }
+  }
+  setActiveCdpPort(cdpPort);
 
   const pathMap = {
     darwin: [
@@ -311,7 +361,7 @@ export async function launch({ port, kill_existing, _deps } = {}) {
   let tvPath = null;
   const candidates = pathMap[platform] || pathMap.linux;
   for (const p of candidates) {
-    if (p && deps.existsSync(p)) { tvPath = p; break; }
+    if (_isValidExecutable(p, deps.existsSync)) { tvPath = p; break; }
   }
 
   if (!tvPath && platform === 'win32') {
@@ -322,7 +372,7 @@ export async function launch({ port, kill_existing, _deps } = {}) {
       const installDir = deps.execSync(ps, { timeout: 5000 }).toString().trim();
       if (installDir) {
         const candidate = `${installDir}\\TradingView.exe`;
-        if (deps.existsSync(candidate)) tvPath = candidate;
+        if (_isValidExecutable(candidate, deps.existsSync)) tvPath = candidate;
       }
     } catch { /* ignore */ }
   }
@@ -331,7 +381,7 @@ export async function launch({ port, kill_existing, _deps } = {}) {
     try {
       const cmd = platform === 'win32' ? 'where TradingView.exe' : 'which tradingview';
       tvPath = deps.execSync(cmd, { timeout: 3000 }).toString().trim().split('\n')[0];
-      if (tvPath && !deps.existsSync(tvPath)) tvPath = null;
+      if (tvPath && !_isValidExecutable(tvPath, deps.existsSync)) tvPath = null;
     } catch { /* ignore */ }
   }
 
@@ -340,7 +390,7 @@ export async function launch({ port, kill_existing, _deps } = {}) {
       const found = deps.execSync('mdfind "kMDItemFSName == TradingView.app" | head -1', { timeout: 5000 }).toString().trim();
       if (found) {
         const candidate = `${found}/Contents/MacOS/TradingView`;
-        if (deps.existsSync(candidate)) tvPath = candidate;
+        if (_isValidExecutable(candidate, deps.existsSync)) tvPath = candidate;
       }
     } catch { /* ignore */ }
   }

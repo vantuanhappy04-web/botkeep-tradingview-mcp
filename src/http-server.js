@@ -1,5 +1,6 @@
 import './env-loader.js';
 import http from 'node:http';
+import net from 'node:net';
 import { randomUUID } from 'node:crypto';
 import { URL } from 'node:url';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
@@ -24,6 +25,68 @@ const PORT = Number(
 );
 const HOST = process.env.HOST || '0.0.0.0';
 const API_KEY = process.env.MCP_API_KEY || '';
+const MT5_MCP_HOST = process.env.MT5_MCP_HOST || '127.0.0.1';
+const MT5_MCP_PORT = Number(process.env.MT5_MCP_PORT || 8080);
+const NOVNC_PORT = Number(process.env.NOVNC_PORT || 6080);
+
+function parseCookies(cookieHeader = '') {
+  const out = {};
+  for (const part of String(cookieHeader).split(';')) {
+    const idx = part.indexOf('=');
+    if (idx > 0) {
+      out[part.slice(0, idx).trim()] = decodeURIComponent(part.slice(idx + 1).trim());
+    }
+  }
+  return out;
+}
+
+function probeTcpPort(host, port, timeoutMs = 1200) {
+  return new Promise((resolve) => {
+    const sock = net.createConnection({ host, port });
+    let done = false;
+    const finish = (ok) => {
+      if (done) return;
+      done = true;
+      try { sock.destroy(); } catch {}
+      resolve(ok);
+    };
+    sock.setTimeout(timeoutMs);
+    sock.once('connect', () => finish(true));
+    sock.once('timeout', () => finish(false));
+    sock.once('error', () => finish(false));
+  });
+}
+
+function proxyHttpRequest(req, res, targetHost, targetPort, targetPath) {
+  const fwdHeaders = { ...req.headers, host: `${targetHost}:${targetPort}` };
+  delete fwdHeaders['authorization'];
+  delete fwdHeaders['x-api-key'];
+  const proxyReq = http.request(
+    {
+      hostname: targetHost,
+      port: targetPort,
+      path: targetPath,
+      method: req.method,
+      headers: fwdHeaders,
+    },
+    (proxyRes) => {
+      const outHeaders = { ...proxyRes.headers };
+      outHeaders['access-control-allow-origin'] = '*';
+      outHeaders['access-control-expose-headers'] = 'mcp-session-id';
+      res.writeHead(proxyRes.statusCode || 502, outHeaders);
+      proxyRes.pipe(res);
+    }
+  );
+  proxyReq.on('error', (err) => {
+    if (!res.headersSent) {
+      res.writeHead(502, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: `Upstream service (${targetHost}:${targetPort}) unavailable: ${err.message}` }));
+    } else {
+      res.end();
+    }
+  });
+  req.pipe(proxyReq);
+}
 
 // Active stateful Streamable HTTP sessions: sessionId -> { transport, server, createdAt }
 const httpSessions = new Map();
@@ -46,7 +109,8 @@ function checkAuth(req, urlObj) {
   const bearer = authHeader.replace(/^Bearer\s+/i, '').trim();
   const headerKey = req.headers['x-api-key'] || '';
   const queryKey = urlObj.searchParams.get('apiKey') || urlObj.searchParams.get('token') || '';
-  return bearer === API_KEY || headerKey === API_KEY || queryKey === API_KEY;
+  const cookieKey = parseCookies(req.headers['cookie'] || '').mcp_auth || '';
+  return bearer === API_KEY || headerKey === API_KEY || queryKey === API_KEY || cookieKey === API_KEY;
 }
 
 function readJsonBody(req) {
@@ -347,13 +411,19 @@ const httpServer = http.createServer(async (req, res) => {
 
       const bState = getBrowserState();
       let tvHealth = null;
-      if (bState.status === 'ready' || bState.status === 'cdp_up_chart_loading') {
+      if (
+        bState.status === 'ready' ||
+        bState.status === 'cdp_up_chart_loading' ||
+        process.env.TV_AUTO_LAUNCH === 'false'
+      ) {
         try {
           tvHealth = await healthCheck();
         } catch (e) {
           tvHealth = { cdp_connected: false, error: e.message };
         }
       }
+      const mt5Up = await probeTcpPort(MT5_MCP_HOST, MT5_MCP_PORT);
+      const novncUp = await probeTcpPort('127.0.0.1', NOVNC_PORT);
 
       const proto = req.headers['x-forwarded-proto'] || 'http';
       const host = req.headers['host'] || `localhost:${PORT}`;
@@ -363,18 +433,20 @@ const httpServer = http.createServer(async (req, res) => {
       res.end(
         JSON.stringify(
           {
-            service: 'tradingview-mcp-remote',
-            version: '2.0.0',
-            tools_count: 84,
+            service: 'trading-mcp-gateway',
+            version: '2.1.0',
+            tools_count: { tradingview: 84, metatrader: 26 },
             status: 'ok',
             auth_enabled: Boolean(API_KEY),
             auto_update_enabled: process.env.TV_AUTO_UPDATE !== 'false',
             endpoints: {
+              tradingview_mcp: `${baseUrl}/mcp`,
+              tradingview_sse: `${baseUrl}/sse`,
+              metatrader_mcp: `${baseUrl}/mt5/mcp`,
+              metatrader_sse: `${baseUrl}/mt5/sse`,
+              remote_desktop_vnc: `${baseUrl}/desktop/vnc.html?autoconnect=true&resize=scale`,
               live_chart_viewer: `${baseUrl}/view`,
               live_screenshot: `${baseUrl}/screenshot`,
-              streamable_http: `${baseUrl}/mcp`,
-              sse: `${baseUrl}/sse`,
-              sse_messages: `${baseUrl}/messages`,
               health: `${baseUrl}/health`,
               update: `${baseUrl}/update`,
               login_cookies: `${baseUrl}/login`,
@@ -386,6 +458,13 @@ const httpServer = http.createServer(async (req, res) => {
             },
             browser: bState,
             tradingview: tvHealth,
+            metatrader: {
+              mcp_listening: mt5Up,
+              upstream: `http://${MT5_MCP_HOST}:${MT5_MCP_PORT}/mcp`,
+            },
+            desktop_vnc: {
+              novnc_listening: novncUp,
+            },
           },
           null,
           2
@@ -397,6 +476,42 @@ const httpServer = http.createServer(async (req, res) => {
     if (!checkAuth(req, urlObj)) {
       res.writeHead(401, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ error: 'Unauthorized: invalid or missing MCP_API_KEY' }));
+      return;
+    }
+
+    // Persist auth cookie in browser when apiKey is supplied via query string (for /desktop noVNC assets & WS)
+    const suppliedQueryKey = urlObj.searchParams.get('apiKey') || urlObj.searchParams.get('token') || '';
+    if (API_KEY && suppliedQueryKey === API_KEY) {
+      res.setHeader('Set-Cookie', `mcp_auth=${encodeURIComponent(API_KEY)}; Path=/; HttpOnly; SameSite=Lax`);
+    }
+
+    // MetaTrader 5 MCP reverse proxy (/mt5, /mt5/mcp, /mt5/sse, /mt5/messages)
+    if (pathname === '/mt5' || pathname.startsWith('/mt5/')) {
+      let subPath = pathname.slice('/mt5'.length) || '/mcp';
+      if (subPath === '/') subPath = '/mcp';
+      const fwdParams = new URLSearchParams(urlObj.searchParams);
+      fwdParams.delete('apiKey');
+      fwdParams.delete('token');
+      const qs = fwdParams.toString();
+      const targetPath = qs ? `${subPath}?${qs}` : subPath;
+      proxyHttpRequest(req, res, MT5_MCP_HOST, MT5_MCP_PORT, targetPath);
+      return;
+    }
+
+    // Live full desktop (TradingView Desktop + MetaTrader 5 via noVNC on 127.0.0.1:6080)
+    if (pathname === '/desktop' || pathname.startsWith('/desktop/')) {
+      if (pathname === '/desktop' || pathname === '/desktop/') {
+        res.writeHead(302, { Location: '/desktop/vnc.html?autoconnect=true&resize=scale' });
+        res.end();
+        return;
+      }
+      const subPath = pathname.slice('/desktop'.length) || '/';
+      const fwdParams = new URLSearchParams(urlObj.searchParams);
+      fwdParams.delete('apiKey');
+      fwdParams.delete('token');
+      const qs = fwdParams.toString();
+      const targetPath = qs ? `${subPath}?${qs}` : subPath;
+      proxyHttpRequest(req, res, '127.0.0.1', NOVNC_PORT, targetPath);
       return;
     }
 
@@ -496,6 +611,44 @@ const httpServer = http.createServer(async (req, res) => {
       res.writeHead(500, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ error: err.message || 'Internal Server Error' }));
     }
+  }
+});
+
+// Proxy WebSocket upgrades for /desktop/websockify (noVNC live desktop)
+httpServer.on('upgrade', (req, socket, head) => {
+  try {
+    const urlObj = new URL(req.url || '/', `http://${req.headers.host || 'localhost'}`);
+    if (!checkAuth(req, urlObj)) {
+      socket.write('HTTP/1.1 401 Unauthorized\r\n\r\n');
+      socket.destroy();
+      return;
+    }
+    const p = urlObj.pathname;
+    if (p === '/websockify' || p === '/desktop/websockify' || p.startsWith('/desktop/')) {
+      const upstreamPath = p.startsWith('/desktop') ? (p.slice('/desktop'.length) || '/websockify') : p;
+      const upstream = net.connect(NOVNC_PORT, '127.0.0.1', () => {
+        const lines = [`GET ${upstreamPath} HTTP/1.1`];
+        for (let i = 0; i < req.rawHeaders.length; i += 2) {
+          const k = req.rawHeaders[i];
+          const v = req.rawHeaders[i + 1];
+          if (k.toLowerCase() === 'host') {
+            lines.push(`Host: 127.0.0.1:${NOVNC_PORT}`);
+          } else {
+            lines.push(`${k}: ${v}`);
+          }
+        }
+        lines.push('', '');
+        upstream.write(lines.join('\r\n'));
+        if (head && head.length) upstream.write(head);
+        socket.pipe(upstream).pipe(socket);
+      });
+      upstream.on('error', () => socket.destroy());
+      socket.on('error', () => upstream.destroy());
+      return;
+    }
+    socket.destroy();
+  } catch {
+    socket.destroy();
   }
 });
 
